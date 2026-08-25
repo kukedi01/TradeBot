@@ -11,10 +11,14 @@ MIN_HISTORY = 20
 # Hysteresis band, same idea as the grid strategy's min_move_pct: a single
 # shared threshold would let a ratio hovering right at the boundary flip the
 # active strategy back and forth every tick on pure noise. Switching TO
-# trending needs a clearly stronger signal (0.35) than switching back OUT of
-# it (0.25) -- in between, whichever regime was already active stays active.
-ENTER_TREND_THRESHOLD = 0.35
-EXIT_TREND_THRESHOLD = 0.25
+# trending needs a clearly stronger signal than switching back OUT of it --
+# in between, whichever regime was already active stays active. Tuned via a
+# backtest sweep across all 4 tradable coins (150-day BTC/ETH/SOL/XRP
+# comparison) rather than picked by feel: 0.30/0.20 gave the best average
+# risk-adjusted result across coins, and nearby values performed similarly,
+# so it isn't a one-off fluke fit to a single symbol's history.
+ENTER_TREND_THRESHOLD = 0.30
+EXIT_TREND_THRESHOLD = 0.20
 
 # Which strategy handles each regime. Grid trading profits from price
 # oscillating inside a band, so it fits ranging markets; trend/momentum only
