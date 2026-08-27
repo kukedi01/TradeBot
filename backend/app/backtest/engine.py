@@ -1,6 +1,8 @@
 from collections import deque
 
 from app.execution.fill_simulator import simulate_fill
+from app.risk.correlation import compute_correlation_matrix_from_returns, correlation_size_multiplier, returns_from_closes
+from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
 from app.strategies.base import StrategyContext
 from app.strategies.registry import STRATEGY_BUILDERS
 from app.strategies.regime import pick_strategy
@@ -150,4 +152,202 @@ def run_backtest(strategy_name: str, symbol: str, candles: list[list], starting_
         "trades": trade_log,
         "win_pnls": win_pnls,
         "loss_pnls": loss_pnls,
+    }
+
+
+def _align_candles(candles_by_symbol: dict[str, list[list]]) -> dict[str, list[list]]:
+    """Keeps only the timestamps every symbol has a candle for, so "step N"
+    means the same moment across all coins. Coins can otherwise differ
+    slightly in history length/start even at the same timeframe (e.g. a
+    later Kraken listing date)."""
+    symbols = list(candles_by_symbol.keys())
+    common_timestamps = {candle[0] for candle in candles_by_symbol[symbols[0]]}
+    for symbol in symbols[1:]:
+        common_timestamps &= {candle[0] for candle in candles_by_symbol[symbol]}
+    return {
+        symbol: sorted((c for c in candles_by_symbol[symbol] if c[0] in common_timestamps), key=lambda c: c[0])
+        for symbol in symbols
+    }
+
+
+def _multi_coin_hold_equity(aligned_candles: dict[str, list[list]], starting_balance_usd: float) -> list[float]:
+    """Same baseline as _run_hold, spread evenly across every coin instead
+    of one -- buy once at the start, never touch it again."""
+    symbols = list(aligned_candles.keys())
+    share = starting_balance_usd / len(symbols)
+    qty = {}
+    for symbol in symbols:
+        first_close = aligned_candles[symbol][0][4]
+        fill_price, q, _fee = simulate_fill(first_close, "buy", 1.0, share, 0.0)
+        qty[symbol] = q
+
+    return [
+        sum(qty[symbol] * aligned_candles[symbol][step][4] for symbol in symbols)
+        for step in range(len(aligned_candles[symbols[0]]))
+    ]
+
+
+def run_multi_coin_backtest(
+    strategy_mode: str,
+    candles_by_symbol: dict[str, list[list]],
+    starting_balance_usd: float = 10000.0,
+    max_drawdown_pct: float | None = None,
+) -> dict:
+    """Mirrors session/loop.py's run_tick as closely as a backtest can: all
+    tradable coins replayed in lockstep against one shared cash pool, with
+    the same correlation-based and concentration-cap buy sizing and the
+    same position-level stop-loss -- none of which run_backtest() above can
+    show, since it only ever simulates one coin in isolation and has no
+    notion of "what else this session is holding."
+
+    strategy_mode is either "auto" (regime-based per-coin switching, like a
+    live auto session) or one of STRATEGY_BUILDERS's keys (that one
+    strategy run independently on every coin, like a live fixed-strategy
+    session).
+
+    The correlation matrix is computed ONCE, from the full backtest
+    window's own daily returns -- not refetched live and not rolled
+    forward candle by candle. A live session recomputes it hourly against
+    whatever the last 90 days looked like *at that moment*; a single
+    snapshot of "how these coins moved during this backtest period" is the
+    same kind of simplification as the train/test validator's split (see
+    validation.py) -- close enough to size trades realistically, not a
+    rolling walk-forward reproduction of the live cache.
+
+    News sentiment is deliberately not simulated here -- there's no
+    historical headline archive to replay, and it's the one live input
+    that's genuinely irreplaceable in a backtest.
+    """
+    is_auto = strategy_mode == "auto"
+    aligned = _align_candles(candles_by_symbol)
+    symbols = list(aligned.keys())
+    step_count = len(aligned[symbols[0]])
+
+    returns_by_symbol = {symbol: returns_from_closes([c[4] for c in aligned[symbol]]) for symbol in symbols}
+    correlation_matrix = compute_correlation_matrix_from_returns(returns_by_symbol)
+
+    cash_usd = starting_balance_usd
+    holdings: dict[str, float] = {}
+    cost_basis: dict[str, float] = {}
+    strategies: dict[tuple[str, str], object] = {}
+    price_histories: dict[str, deque[float]] = {symbol: deque(maxlen=REGIME_HISTORY_LENGTH) for symbol in symbols}
+    previous_regime: dict[str, str | None] = {symbol: None for symbol in symbols}
+
+    equity_curve: list[float] = []
+    trade_log: list[dict] = []
+    win_pnls: list[float] = []
+    loss_pnls: list[float] = []
+    stopped = False
+
+    def get_strategy(symbol: str, name: str, first_price: float):
+        key = (symbol, name)
+        if key not in strategies:
+            strategies[key] = STRATEGY_BUILDERS[name](symbol, first_price)
+        return strategies[key]
+
+    for step in range(step_count):
+        prices = {symbol: aligned[symbol][step][4] for symbol in symbols}
+
+        if not stopped:
+            for symbol in symbols:
+                base_asset = symbol.split("/")[0]
+                price = prices[symbol]
+
+                if is_auto:
+                    price_histories[symbol].append(price)
+                    active_strategy_name, previous_regime[symbol] = pick_strategy(
+                        list(price_histories[symbol]), previous_regime[symbol]
+                    )
+                    candidate_names = list(STRATEGY_BUILDERS.keys())
+                else:
+                    active_strategy_name = strategy_mode
+                    candidate_names = [strategy_mode]
+
+                # Position-level stop-loss, checked before this symbol's
+                # strategies get a turn this step -- same order as
+                # session/loop.py's run_tick.
+                held_qty = holdings.get(base_asset, 0)
+                if held_qty > 0:
+                    stop_loss = check_position_stop_loss(price, cost_basis.get(base_asset, 0.0))
+                    if stop_loss.triggered:
+                        fill_price, qty, fee = simulate_fill(price, "sell", 1.0, cash_usd, held_qty)
+                        if qty > 0:
+                            realized_pnl = (fill_price - cost_basis.get(base_asset, 0.0)) * qty - fee
+                            (win_pnls if realized_pnl > 0 else loss_pnls).append(realized_pnl)
+                            cash_usd += fill_price * qty - fee
+                            holdings[base_asset] = held_qty - qty
+                            trade_log.append(
+                                {
+                                    "side": "sell",
+                                    "symbol": symbol,
+                                    "qty": qty,
+                                    "price": fill_price,
+                                    "fee": fee,
+                                    "reason": f"risk: stop-loss triggered ({stop_loss.loss_pct:.1f}% below entry)",
+                                }
+                            )
+                            for name in candidate_names:
+                                key = (symbol, name)
+                                if key in strategies:
+                                    strategies[key].on_external_sell()
+
+                ctx = StrategyContext(symbol=symbol, price=price, cash_usd=cash_usd, holdings=dict(holdings))
+
+                for name in candidate_names:
+                    strategy = get_strategy(symbol, name, price)
+                    for signal in strategy.on_tick(ctx):
+                        if signal.side == "buy" and name != active_strategy_name:
+                            continue
+                        size_fraction = signal.size_fraction
+                        if signal.side == "buy":
+                            size_fraction *= correlation_size_multiplier(symbol, holdings, prices, correlation_matrix)
+                            size_fraction *= concentration_size_multiplier(
+                                symbol, size_fraction, cash_usd, holdings, prices
+                            )
+                        held_qty = holdings.get(base_asset, 0)
+                        fill_price, qty, fee = simulate_fill(price, signal.side, size_fraction, cash_usd, held_qty)
+                        if qty <= 0:
+                            continue
+                        if signal.side == "buy":
+                            cash_usd -= fill_price * qty + fee
+                            avg_cost = cost_basis.get(base_asset, 0.0)
+                            cost_basis[base_asset] = (avg_cost * held_qty + fill_price * qty) / (held_qty + qty)
+                            holdings[base_asset] = held_qty + qty
+                        else:
+                            realized_pnl = (fill_price - cost_basis.get(base_asset, 0.0)) * qty - fee
+                            (win_pnls if realized_pnl > 0 else loss_pnls).append(realized_pnl)
+                            cash_usd += fill_price * qty - fee
+                            holdings[base_asset] = held_qty - qty
+                        trade_log.append(
+                            {
+                                "side": signal.side,
+                                "symbol": symbol,
+                                "qty": qty,
+                                "price": fill_price,
+                                "fee": fee,
+                                "reason": signal.reason,
+                            }
+                        )
+
+        total_value = cash_usd + sum(holdings.get(sym.split("/")[0], 0) * prices[sym] for sym in symbols)
+        equity_curve.append(total_value)
+
+        if not stopped:
+            # Same guardrail as a live session: once the portfolio has
+            # fallen too far below its own peak, stop trading for the rest
+            # of the backtest (the equity curve keeps marking frozen
+            # holdings to market, same as a real risk_stopped session that
+            # nobody has manually closed).
+            risk_check = check_drawdown_limit(total_value, equity_curve[:-1], max_drawdown_pct)
+            if risk_check.breached:
+                stopped = True
+
+    return {
+        "starting_balance_usd": starting_balance_usd,
+        "equity_curve": equity_curve,
+        "hodl_equity_curve": _multi_coin_hold_equity(aligned, starting_balance_usd),
+        "trades": trade_log,
+        "win_pnls": win_pnls,
+        "loss_pnls": loss_pnls,
+        "stopped_early": stopped,
     }

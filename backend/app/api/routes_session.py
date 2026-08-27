@@ -15,7 +15,7 @@ from app.db.database import SessionLocal
 from app.db.models import Portfolio, PortfolioSnapshot, Trade, TradingSession
 from app.execution.paper_executor import PaperExecutor
 from app.session import manager
-from app.session.loop import get_regime_state, run_tick
+from app.session.loop import get_decision_log, get_regime_state, run_tick
 
 router = APIRouter(prefix="/session", tags=["session"])
 
@@ -145,6 +145,18 @@ def get_regime(session_id: int, db: DbSession = Depends(get_db)):
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"per_symbol": get_regime_state(session_id)}
+
+
+@router.get("/{session_id}/decisions")
+def get_decisions(session_id: int, db: DbSession = Depends(get_db)):
+    """Every recent signal a strategy produced and what happened to it --
+    executed, or blocked/shrunk and why (inactive strategy, sentiment pause,
+    correlation/concentration sizing, stop-loss). The trade list only shows
+    what *did* happen; this is the "why didn't it trade" view."""
+    session = manager.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"decisions": get_decision_log(session_id)}
 
 
 @router.post("/{session_id}/tick")

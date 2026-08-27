@@ -4,11 +4,19 @@ from typing import Optional
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session as DbSession
 
-from app.api.schemas import BacktestResult, MonteCarloOut, PositionSizeOut, StrategyPerformanceOut, ValidationResult
+from app.api.schemas import (
+    BacktestResult,
+    MonteCarloOut,
+    MultiCoinBacktestResult,
+    PositionSizeOut,
+    StrategyPerformanceOut,
+    ValidationResult,
+)
 from app.backtest.data_loader import fetch_historical_ohlcv, fetch_ohlcv_between
-from app.backtest.engine import run_backtest
+from app.backtest.engine import run_backtest, run_multi_coin_backtest
 from app.backtest.metrics import compute_metrics
 from app.backtest.validation import run_train_test_split
+from app.constants import TRADABLE_SYMBOLS
 from app.db.database import SessionLocal
 from app.db.models import StrategyPerformanceRecord
 from app.risk.monte_carlo import run_monte_carlo
@@ -98,6 +106,39 @@ def monte_carlo_endpoint(
     result = run_backtest(strategy_name, symbol, candles, starting_balance_usd)
     sim = run_monte_carlo(result["equity_curve"], num_simulations, confidence)
     return MonteCarloOut(strategy_name=strategy_name, symbol=symbol, days=days, **sim)
+
+
+@router.post("/multi-coin/{strategy_mode}", response_model=MultiCoinBacktestResult)
+def run_multi_coin_backtest_endpoint(
+    strategy_mode: str,
+    days: int = 150,
+    starting_balance_usd: float = 10000.0,
+    max_drawdown_pct: Optional[float] = 20.0,
+):
+    """Backtests a full multi-coin session (see run_multi_coin_backtest's
+    docstring) -- shared cash pool across all 4 tradable coins, with the
+    same correlation/concentration sizing and stop-loss a live session
+    applies, unlike the single-symbol /backtest/{strategy_name} above."""
+    candles_by_symbol = {symbol: fetch_historical_ohlcv(symbol, days=days) for symbol in TRADABLE_SYMBOLS}
+    result = run_multi_coin_backtest(strategy_mode, candles_by_symbol, starting_balance_usd, max_drawdown_pct)
+    metrics = compute_metrics(result)
+    hodl_metrics = compute_metrics(
+        {
+            "starting_balance_usd": starting_balance_usd,
+            "equity_curve": result["hodl_equity_curve"],
+            "win_pnls": [],
+            "loss_pnls": [],
+            "trades": [],
+        }
+    )
+    return MultiCoinBacktestResult(
+        strategy_name=strategy_mode,
+        symbols=TRADABLE_SYMBOLS,
+        days=days,
+        hodl_total_return_pct=hodl_metrics["total_return_pct"],
+        stopped_early=result["stopped_early"],
+        **metrics,
+    )
 
 
 @router.get("", response_model=list[StrategyPerformanceOut])

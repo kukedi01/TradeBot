@@ -32,6 +32,11 @@ class Portfolio(Base):
     session_id = Column(Integer, primary_key=True)
     cash_usd = Column(Float, nullable=False)
     holdings = Column(JSON, default=dict)
+    # Weighted-average entry price per held asset (same formula the backtest
+    # engine uses to classify win/loss trades) -- lets the position-level
+    # stop-loss guardrail tell how far a coin has fallen from where it was
+    # actually bought, not just from its current price.
+    cost_basis = Column(JSON, default=dict)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 

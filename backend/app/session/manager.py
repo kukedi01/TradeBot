@@ -2,9 +2,9 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session as DbSession
 
+from app.constants import TRADABLE_SYMBOLS
 from app.db.models import Portfolio, TradingSession
 from app.market_data.kraken_client import get_ticker_price
-from app.session.loop import TRADABLE_SYMBOLS
 
 
 def create_session(

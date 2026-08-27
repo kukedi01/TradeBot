@@ -77,3 +77,10 @@ class TrendMomentumStrategy(Strategy):
             ]
 
         return []
+
+    def on_external_sell(self) -> None:
+        # A stop-loss liquidation outside this strategy's own logic still
+        # closes the position -- without this, in_position would stay True
+        # until a death cross or band break happens to occur too, blocking
+        # any new buy signal in the meantime even though nothing is held.
+        self.in_position = False

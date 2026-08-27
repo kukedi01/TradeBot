@@ -95,3 +95,10 @@ class GridStrategy(Strategy):
 
         self.last_level = level
         return signals
+
+    def on_external_sell(self) -> None:
+        # A stop-loss liquidation outside this strategy's own logic means
+        # every level it thought it owned is no longer actually held --
+        # otherwise it would refuse to re-buy a dip at a level it still
+        # (incorrectly) believes it's holding.
+        self.owned_levels = set()

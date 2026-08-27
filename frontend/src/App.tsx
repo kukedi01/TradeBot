@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   getActiveSession,
+  getDecisions,
   getNews,
   getRecommendation,
   getRegimeState,
@@ -13,6 +14,7 @@ import {
   stopAllSessions,
   stopSession,
   tickNow,
+  type Decision,
   type NewsItem,
   type Recommendation,
   type RegimeEntry,
@@ -39,12 +41,29 @@ const STRATEGY_LABELS: Record<string, string> = {
   grid: "Grid (sávkereskedés)",
   dca_rebalance: "DCA + rebalanszolás",
   trend_momentum: "Trend/momentum",
+  risk: "Kockázatkezelés",
+};
+
+const OUTCOME_LABELS: Record<Decision["outcome"], string> = {
+  executed: "Végrehajtva",
+  blocked_inactive_strategy: "Blokkolva — nem az aktív stratégia",
+  blocked_sentiment_pause: "Blokkolva — negatív hírhangulat",
+  zero_after_sizing: "Elvetve — a méret nullára csökkent",
+  stop_loss_triggered: "Stop-loss aktiválva",
+};
+
+const OUTCOME_CLASS: Record<Decision["outcome"], string> = {
+  executed: "outcome-good",
+  blocked_inactive_strategy: "outcome-muted",
+  blocked_sentiment_pause: "outcome-warning",
+  zero_after_sizing: "outcome-muted",
+  stop_loss_triggered: "outcome-critical",
 };
 
 function sentimentColor(score: number): string {
-  if (score <= -0.3) return "#c0392b";
-  if (score >= 0.3) return "#2ecc71";
-  return "#f1c40f";
+  if (score <= -0.3) return "#f43f5e";
+  if (score >= 0.3) return "#34d399";
+  return "#fbbf24";
 }
 
 function App() {
@@ -53,6 +72,7 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [regimeState, setRegimeState] = useState<RegimeEntry[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
+  const [decisions, setDecisions] = useState<Decision[]>([]);
   const [riskLevel, setRiskLevel] = useState("medium");
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
   const [startingBalance, setStartingBalance] = useState(1000);
@@ -78,16 +98,18 @@ function App() {
   }, [riskLevel]);
 
   const refresh = async (sessionId: number) => {
-    const [updatedSession, updatedTrades, updatedRegime, updatedSnapshots] = await Promise.all([
+    const [updatedSession, updatedTrades, updatedRegime, updatedSnapshots, updatedDecisions] = await Promise.all([
       getSession(sessionId),
       getTrades(sessionId),
       getRegimeState(sessionId),
       getSnapshots(sessionId),
+      getDecisions(sessionId),
     ]);
     setSession(updatedSession);
     setTrades(updatedTrades);
     setRegimeState(updatedRegime);
     setSnapshots(updatedSnapshots);
+    setDecisions(updatedDecisions);
   };
 
   useEffect(() => {
@@ -405,6 +427,44 @@ function App() {
                       <td>{trade.price.toFixed(2)}</td>
                       <td>{trade.fee.toFixed(2)}</td>
                       <td>{trade.reason}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            )}
+          </section>
+          <section className="panel">
+            <h2>Döntési napló</h2>
+            <p className="rationale">
+              Nem csak a végrehajtott kötések — az is látszik, ha egy stratégia venni akart, de a rendszer blokkolta
+              vagy lecsökkentette a méretét.
+            </p>
+            {decisions.length === 0 ? (
+              <p style={{ marginTop: 12 }}>Még nincs döntési esemény.</p>
+            ) : (
+              <table style={{ marginTop: 12 }}>
+                <thead>
+                  <tr>
+                    <th>Idő</th>
+                    <th>Coin</th>
+                    <th>Stratégia</th>
+                    <th>Irány</th>
+                    <th>Kimenetel</th>
+                    <th>Indoklás</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {decisions.slice(0, 30).map((d, i) => (
+                    <tr key={i}>
+                      <td>{new Date(d.timestamp).toLocaleTimeString()}</td>
+                      <td>{d.symbol}</td>
+                      <td>{STRATEGY_LABELS[d.strategy] ?? d.strategy}</td>
+                      <td>{d.side}</td>
+                      <td className={OUTCOME_CLASS[d.outcome]}>
+                        {OUTCOME_LABELS[d.outcome]}
+                        {d.shrunk_pct ? ` (méret −${d.shrunk_pct}%)` : ""}
+                      </td>
+                      <td>{d.reason ?? d.detail ?? "—"}</td>
                     </tr>
                   ))}
                 </tbody>

@@ -85,6 +85,20 @@ class BacktestResult(BaseModel):
     trade_count: int
 
 
+class MultiCoinBacktestResult(BaseModel):
+    strategy_name: str
+    symbols: list[str]
+    days: int
+    total_return_pct: float
+    max_drawdown_pct: float
+    win_rate_pct: float
+    volatility: float
+    sharpe_like_ratio: float
+    trade_count: int
+    hodl_total_return_pct: float
+    stopped_early: bool
+
+
 class PeriodMetrics(BaseModel):
     total_return_pct: float
     max_drawdown_pct: float

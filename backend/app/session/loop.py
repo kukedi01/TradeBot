@@ -1,22 +1,20 @@
 from collections import deque
+from datetime import datetime
 
 from sqlalchemy.orm import Session as DbSession
 
+from app.constants import TRADABLE_SYMBOLS
 from app.db.models import Portfolio, PortfolioSnapshot, TradingSession
 from app.execution.paper_executor import PaperExecutor
 from app.market_data.kraken_client import get_ticker_price
 from app.news.reactor import get_sentiment_state
-from app.risk.guardrails import check_drawdown_limit
+from app.risk.correlation import correlation_size_multiplier, get_correlation_matrix
+from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
 from app.risk.position_sizing import compute_kelly_size_for_strategy
 from app.session.state_store import REGIME_HISTORY_KEY, load_state, save_state
 from app.strategies.base import Strategy, StrategyContext
 from app.strategies.registry import STRATEGY_BUILDERS
 from app.strategies.regime import REGIME_STRATEGY, pick_strategy
-
-# Coins a session can spread its cash across to reach its goal -- which one
-# gets there doesn't matter, so the same strategy runs independently on each,
-# all drawing from (and adding back to) the session's one shared cash pool.
-TRADABLE_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR"]
 
 # A session with this strategy_name doesn't pick one strategy up front --
 # every tick, each coin's recent price action decides which strategy handles
@@ -25,6 +23,11 @@ AUTO_STRATEGY = "auto"
 
 REGIME_HISTORY_LENGTH = 30
 
+# How many recent decision-log entries to keep per session -- a rolling
+# diagnostic feed (see _log_decision), not durable state, so this resets on
+# a backend restart same as _strategy_instances below.
+DECISION_LOG_LENGTH = 200
+
 # One strategy instance per (session, symbol, strategy). In auto mode all
 # three strategies for a symbol are kept ticking every cycle so their
 # internal state (grid levels, moving averages, ...) stays warm even while
@@ -32,6 +35,21 @@ REGIME_HISTORY_LENGTH = 30
 _strategy_instances: dict[tuple[int, str, str], Strategy] = {}
 _price_histories: dict[tuple[int, str], deque[float]] = {}
 _regime_state: dict[tuple[int, str], dict] = {}
+# Every signal a strategy produced this session and what happened to it --
+# executed, or blocked/shrunk and why. The trade table only shows what
+# *did* happen; this is what lets the frontend show why a strategy that
+# looked "active" still didn't trade.
+_decision_log: dict[int, deque[dict]] = {}
+
+
+def _log_decision(session_id: int, entry: dict) -> None:
+    if session_id not in _decision_log:
+        _decision_log[session_id] = deque(maxlen=DECISION_LOG_LENGTH)
+    _decision_log[session_id].appendleft({"timestamp": datetime.utcnow().isoformat(), **entry})
+
+
+def get_decision_log(session_id: int) -> list[dict]:
+    return list(_decision_log.get(session_id, []))
 
 
 def _get_strategy(db: DbSession, session_id: int, symbol: str, strategy_name: str) -> Strategy:
@@ -78,11 +96,14 @@ def run_tick(db: DbSession, session_id: int) -> list[str]:
     sentiment = get_sentiment_state()
     executor = PaperExecutor(db, session_id)
     executed: list[str] = []
-    prices: dict[str, float] = {}
+    # Fetched upfront (not lazily as each symbol is processed) so the
+    # correlation-based sizing below always has every coin's current price
+    # available, even for a buy signal on the first symbol in the loop.
+    prices: dict[str, float] = {symbol: get_ticker_price(symbol) for symbol in TRADABLE_SYMBOLS}
+    correlation_matrix = get_correlation_matrix(TRADABLE_SYMBOLS)
 
     for symbol in TRADABLE_SYMBOLS:
-        price = get_ticker_price(symbol)
-        prices[symbol] = price
+        price = prices[symbol]
 
         if is_auto:
             history_key = (session_id, symbol)
@@ -106,6 +127,40 @@ def run_tick(db: DbSession, session_id: int) -> list[str]:
             active_strategy_name = session.strategy_name or "grid"
             candidate_names = [active_strategy_name]
 
+        # Position-level stop-loss: independent of any strategy's own exit
+        # logic (which can lag a fast drop), and checked before any
+        # strategy signal this tick, using the weighted-average entry price
+        # PaperExecutor tracks per asset.
+        base_asset = symbol.split("/")[0]
+        held_qty = (portfolio.holdings or {}).get(base_asset, 0)
+        if held_qty > 0:
+            avg_cost = (portfolio.cost_basis or {}).get(base_asset, 0.0)
+            stop_loss = check_position_stop_loss(price, avg_cost)
+            if stop_loss.triggered:
+                fill = executor.place_order(
+                    symbol, "sell", 1.0, f"risk: stop-loss triggered ({stop_loss.loss_pct:.1f}% below entry)"
+                )
+                if fill is not None:
+                    executed.append(f"{fill.side} {fill.qty:.6f} {fill.symbol} @ {fill.price:.2f} (stop-loss)")
+                    _log_decision(
+                        session_id,
+                        {
+                            "symbol": symbol,
+                            "strategy": "risk",
+                            "side": "sell",
+                            "outcome": "stop_loss_triggered",
+                            "detail": f"{stop_loss.loss_pct:.1f}% below entry",
+                        },
+                    )
+                    # The strategies ticking this symbol don't know their
+                    # position just got closed out from under them --
+                    # without this, e.g. trend/momentum's in_position flag
+                    # would stay stale and block a legitimate new buy later.
+                    for strategy_name in candidate_names:
+                        key = (session_id, symbol, strategy_name)
+                        if key in _strategy_instances:
+                            _strategy_instances[key].on_external_sell()
+
         ctx = StrategyContext(
             symbol=symbol,
             price=price,
@@ -120,6 +175,8 @@ def run_tick(db: DbSession, session_id: int) -> list[str]:
             signals = strategy.on_tick(ctx)
             save_state(db, session_id, symbol, strategy_name, strategy.get_state())
             for signal in signals:
+                log_base = {"symbol": signal.symbol, "strategy": strategy_name, "side": signal.side, "reason": signal.reason}
+
                 # Only the regime-selected strategy gets to open new
                 # positions -- but a sell from an inactive strategy (e.g. it
                 # bought while active, then lost the regime and now wants to
@@ -127,18 +184,39 @@ def run_tick(db: DbSession, session_id: int) -> list[str]:
                 # strategy that's no longer active could be stranded with no
                 # one left willing to sell it.
                 if signal.side == "buy" and strategy_name != active_strategy_name:
+                    _log_decision(session_id, {**log_base, "outcome": "blocked_inactive_strategy"})
                     continue
                 # News sentiment only ever holds back or shrinks buys -- selling
                 # out of a position must never be blocked by a bad-news pause.
                 if signal.side == "buy" and sentiment.pause_new_entries:
+                    _log_decision(session_id, {**log_base, "outcome": "blocked_sentiment_pause"})
                     continue
                 size_fraction = signal.size_fraction
+                original_fraction = size_fraction
                 if signal.side == "buy":
                     size_fraction *= sentiment.size_multiplier
+                    # Re-read holdings on every signal, not once per tick --
+                    # an earlier buy/sell this same tick (e.g. on BTC) must
+                    # already count toward sizing a later one (e.g. on ETH).
+                    size_fraction *= correlation_size_multiplier(
+                        signal.symbol, portfolio.holdings or {}, prices, correlation_matrix
+                    )
+                    # Hard ceiling, applied after the soft correlation
+                    # discount -- two coins with zero correlation to each
+                    # other could otherwise both get bought up to 100% of
+                    # the portfolio each.
+                    size_fraction *= concentration_size_multiplier(
+                        signal.symbol, size_fraction, portfolio.cash_usd, portfolio.holdings or {}, prices
+                    )
                 fill = executor.place_order(signal.symbol, signal.side, size_fraction, signal.reason)
                 if fill is None:
+                    _log_decision(session_id, {**log_base, "outcome": "zero_after_sizing"})
                     continue
                 executed.append(f"{fill.side} {fill.qty:.6f} {fill.symbol} @ {fill.price:.2f} ({signal.reason})")
+                entry = {**log_base, "outcome": "executed", "qty": fill.qty, "price": fill.price}
+                if signal.side == "buy" and size_fraction < original_fraction * 0.99:
+                    entry["shrunk_pct"] = round((1 - size_fraction / original_fraction) * 100, 1)
+                _log_decision(session_id, entry)
 
     holdings = portfolio.holdings or {}
     total_value = portfolio.cash_usd

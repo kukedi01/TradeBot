@@ -29,6 +29,15 @@ class Strategy(ABC):
     def on_tick(self, ctx: StrategyContext) -> list[TradeSignal]:
         ...
 
+    def on_external_sell(self) -> None:
+        """Called when a position gets closed outside this strategy's own
+        on_tick logic (e.g. the position-level stop-loss guardrail
+        liquidates it). No-op by default; a strategy that tracks "am I in a
+        position" internally (grid's owned levels, trend/momentum's
+        in_position flag) must override this so that state doesn't go stale
+        and block/confuse its own future signals."""
+        pass
+
     def get_state(self) -> dict:
         """Generic snapshot of every instance attribute, so a strategy's
         memory (grid levels bought, moving-average history, ...) survives a

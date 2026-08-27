@@ -27,6 +27,8 @@ class PaperExecutor(ExecutionEngine):
         portfolio = self._portfolio()
         holdings = dict(portfolio.holdings or {})
         held_qty = holdings.get(base_asset, 0)
+        cost_basis = dict(portfolio.cost_basis or {})
+        avg_cost = cost_basis.get(base_asset, 0.0)
 
         fill_price, qty, fee = simulate_fill(market_price, side, size_fraction, portfolio.cash_usd, held_qty)
 
@@ -38,12 +40,17 @@ class PaperExecutor(ExecutionEngine):
 
         if side == "buy":
             portfolio.cash_usd -= fill_price * qty + fee
+            # Weighted-average cost basis, same formula the backtest engine
+            # uses -- naturally resets to fill_price when held_qty is 0, so
+            # no separate reset is needed once a position is fully closed.
+            cost_basis[base_asset] = (avg_cost * held_qty + fill_price * qty) / (held_qty + qty)
             holdings[base_asset] = held_qty + qty
         else:
             portfolio.cash_usd += fill_price * qty - fee
             holdings[base_asset] = held_qty - qty
 
         portfolio.holdings = holdings
+        portfolio.cost_basis = cost_basis
         portfolio.updated_at = datetime.utcnow()
 
         trade = Trade(

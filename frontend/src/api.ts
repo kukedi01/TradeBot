@@ -165,3 +165,27 @@ export async function getSnapshots(sessionId: number): Promise<Snapshot[]> {
   const res = await fetch(`${API_BASE}/session/${sessionId}/snapshots`);
   return res.json();
 }
+
+export interface Decision {
+  timestamp: string;
+  symbol: string;
+  strategy: string;
+  side: "buy" | "sell";
+  reason?: string;
+  detail?: string;
+  outcome:
+    | "executed"
+    | "blocked_inactive_strategy"
+    | "blocked_sentiment_pause"
+    | "zero_after_sizing"
+    | "stop_loss_triggered";
+  qty?: number;
+  price?: number;
+  shrunk_pct?: number;
+}
+
+export async function getDecisions(sessionId: number): Promise<Decision[]> {
+  const res = await fetch(`${API_BASE}/session/${sessionId}/decisions`);
+  const data = await res.json();
+  return data.decisions;
+}
