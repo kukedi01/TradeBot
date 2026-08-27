@@ -1,3 +1,4 @@
+import threading
 from collections import deque
 from datetime import datetime
 
@@ -46,6 +47,17 @@ _regime_state: dict[tuple[int, str], dict] = {}
 _decision_log: dict[int, deque[dict]] = {}
 
 
+# The APScheduler job never overlaps itself (max_instances=1 skips a cycle
+# rather than running two at once -- see scheduler.py), but a manual
+# POST /session/{id}/tick can still land while the scheduler's own tick for
+# that same session is mid-flight. Two concurrent run_tick() calls for the
+# same session would each build their own strategy instances, race on the
+# same Portfolio row, and clobber each other's saved state -- exactly the
+# kind of corruption that left phantom grid owned_levels behind. One lock
+# per session, non-blocking: a tick that can't get in skips rather than waits.
+_tick_locks: dict[int, threading.Lock] = {}
+
+
 def _log_decision(session_id: int, entry: dict) -> None:
     if session_id not in _decision_log:
         _decision_log[session_id] = deque(maxlen=DECISION_LOG_LENGTH)
@@ -91,6 +103,16 @@ def get_regime_state(session_id: int) -> list[dict]:
 
 
 def run_tick(db: DbSession, session_id: int) -> list[str]:
+    lock = _tick_locks.setdefault(session_id, threading.Lock())
+    if not lock.acquire(blocking=False):
+        return []
+    try:
+        return _run_tick_locked(db, session_id)
+    finally:
+        lock.release()
+
+
+def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
     session = db.get(TradingSession, session_id)
     portfolio = db.get(Portfolio, session_id)
     if session is None or portfolio is None:
@@ -177,7 +199,6 @@ def run_tick(db: DbSession, session_id: int) -> list[str]:
         for strategy_name in candidate_names:
             strategy = _get_strategy(db, session_id, symbol, strategy_name)
             signals = strategy.on_tick(ctx)
-            save_state(db, session_id, symbol, strategy_name, strategy.get_state())
             for signal in signals:
                 log_base = {"symbol": signal.symbol, "strategy": strategy_name, "side": signal.side, "reason": signal.reason}
 
@@ -189,11 +210,13 @@ def run_tick(db: DbSession, session_id: int) -> list[str]:
                 # one left willing to sell it.
                 if signal.side == "buy" and strategy_name != active_strategy_name:
                     _log_decision(session_id, {**log_base, "outcome": "blocked_inactive_strategy"})
+                    strategy.on_signal_not_filled()
                     continue
                 # News sentiment only ever holds back or shrinks buys -- selling
                 # out of a position must never be blocked by a bad-news pause.
                 if signal.side == "buy" and sentiment.pause_new_entries:
                     _log_decision(session_id, {**log_base, "outcome": "blocked_sentiment_pause"})
+                    strategy.on_signal_not_filled()
                     continue
                 size_fraction = signal.size_fraction
                 original_fraction = size_fraction
@@ -215,12 +238,19 @@ def run_tick(db: DbSession, session_id: int) -> list[str]:
                 fill = executor.place_order(signal.symbol, signal.side, size_fraction, signal.reason)
                 if fill is None:
                     _log_decision(session_id, {**log_base, "outcome": "zero_after_sizing"})
+                    strategy.on_signal_not_filled()
                     continue
                 executed.append(f"{fill.side} {fill.qty:.6f} {fill.symbol} @ {fill.price:.2f} ({signal.reason})")
                 entry = {**log_base, "outcome": "executed", "qty": fill.qty, "price": fill.price}
                 if signal.side == "buy" and size_fraction < original_fraction * 0.99:
                     entry["shrunk_pct"] = round((1 - size_fraction / original_fraction) * 100, 1)
                 _log_decision(session_id, entry)
+
+            # Saved after signal processing (not right after on_tick) so a
+            # speculative owned_levels/in_position mutation that
+            # on_signal_not_filled() just rolled back is never the version
+            # that lands in the DB.
+            save_state(db, session_id, symbol, strategy_name, strategy.get_state())
 
     holdings = portfolio.holdings or {}
     total_value = portfolio.cash_usd

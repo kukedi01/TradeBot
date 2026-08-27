@@ -33,6 +33,10 @@ class TrendMomentumStrategy(Strategy):
         self.order_size_fraction = order_size_fraction
         self.price_history: deque[float] = deque(maxlen=history_size)
         self.in_position = False
+        # Set right before returning a buy/sell signal, so on_signal_not_filled
+        # can undo the speculative in_position flip if the signal never
+        # actually results in a fill (see that method).
+        self._pending_previous_in_position: bool | None = None
 
     def on_tick(self, ctx: StrategyContext) -> list[TradeSignal]:
         self.price_history.append(ctx.price)
@@ -51,6 +55,7 @@ class TrendMomentumStrategy(Strategy):
         not_blow_off_top = current_rsi < self.rsi_extreme_overbought
 
         if golden_cross and above_middle_band and not_blow_off_top and not self.in_position:
+            self._pending_previous_in_position = self.in_position
             self.in_position = True
             return [
                 TradeSignal(
@@ -65,6 +70,7 @@ class TrendMomentumStrategy(Strategy):
         trend_broken = ctx.price < middle_band
 
         if (death_cross or trend_broken) and self.in_position:
+            self._pending_previous_in_position = self.in_position
             self.in_position = False
             reason = "death cross" if death_cross else f"price fell below Bollinger middle band ({middle_band:.2f})"
             return [
@@ -84,3 +90,13 @@ class TrendMomentumStrategy(Strategy):
         # until a death cross or band break happens to occur too, blocking
         # any new buy signal in the meantime even though nothing is held.
         self.in_position = False
+
+    def on_signal_not_filled(self) -> None:
+        # The buy/sell this tick's on_tick() just returned never actually
+        # went through -- undo the speculative in_position flip made when
+        # the signal was created, or this strategy believes it holds (or
+        # doesn't hold) a position that was never actually opened/closed.
+        if self._pending_previous_in_position is None:
+            return
+        self.in_position = self._pending_previous_in_position
+        self._pending_previous_in_position = None

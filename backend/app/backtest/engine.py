@@ -59,9 +59,11 @@ def _run_auto(symbol: str, candles: list[list], starting_balance_usd: float) -> 
         for strategy_name, strategy in strategies.items():
             for signal in strategy.on_tick(ctx):
                 if signal.side == "buy" and strategy_name != active_strategy_name:
+                    strategy.on_signal_not_filled()
                     continue
                 fill_price, qty, fee = simulate_fill(close, signal.side, signal.size_fraction, cash_usd, held_qty)
                 if qty <= 0:
+                    strategy.on_signal_not_filled()
                     continue
 
                 if signal.side == "buy":
@@ -125,6 +127,7 @@ def run_backtest(strategy_name: str, symbol: str, candles: list[list], starting_
         for signal in signals:
             fill_price, qty, fee = simulate_fill(close, signal.side, signal.size_fraction, cash_usd, held_qty)
             if qty <= 0:
+                strategy.on_signal_not_filled()
                 continue
 
             if signal.side == "buy":
@@ -297,6 +300,7 @@ def run_multi_coin_backtest(
                     strategy = get_strategy(symbol, name, price)
                     for signal in strategy.on_tick(ctx):
                         if signal.side == "buy" and name != active_strategy_name:
+                            strategy.on_signal_not_filled()
                             continue
                         size_fraction = signal.size_fraction
                         if signal.side == "buy":
@@ -307,6 +311,7 @@ def run_multi_coin_backtest(
                         held_qty = holdings.get(base_asset, 0)
                         fill_price, qty, fee = simulate_fill(price, signal.side, size_fraction, cash_usd, held_qty)
                         if qty <= 0:
+                            strategy.on_signal_not_filled()
                             continue
                         if signal.side == "buy":
                             cash_usd -= fill_price * qty + fee

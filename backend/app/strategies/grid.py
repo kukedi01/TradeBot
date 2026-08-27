@@ -38,6 +38,10 @@ class GridStrategy(Strategy):
         self.last_level: int | None = None
         self.last_trade_price: float | None = None
         self.ticks_out_of_range = 0
+        # Set right before returning a buy/sell signal, so on_signal_not_filled
+        # can undo the speculative owned_levels/last_trade_price mutation if
+        # the signal never actually results in a fill (see that method).
+        self._pending_signal: dict | None = None
 
     def _level(self, price: float) -> int:
         return int((price - self.lower_bound) // self.step)
@@ -70,9 +74,11 @@ class GridStrategy(Strategy):
         signals: list[TradeSignal] = []
 
         if self.last_level is not None and self._far_enough_from_last_trade(ctx.price):
+            previous_trade_price = self.last_trade_price
             if level < self.last_level and level not in self.owned_levels:
                 self.owned_levels.add(level)
                 self.last_trade_price = ctx.price
+                self._pending_signal = {"side": "buy", "level": level, "previous_trade_price": previous_trade_price}
                 signals.append(
                     TradeSignal(
                         symbol=self.symbol,
@@ -84,6 +90,11 @@ class GridStrategy(Strategy):
             elif level > self.last_level and self.last_level in self.owned_levels:
                 self.owned_levels.discard(self.last_level)
                 self.last_trade_price = ctx.price
+                self._pending_signal = {
+                    "side": "sell",
+                    "level": self.last_level,
+                    "previous_trade_price": previous_trade_price,
+                }
                 signals.append(
                     TradeSignal(
                         symbol=self.symbol,
@@ -102,3 +113,19 @@ class GridStrategy(Strategy):
         # otherwise it would refuse to re-buy a dip at a level it still
         # (incorrectly) believes it's holding.
         self.owned_levels = set()
+
+    def on_signal_not_filled(self) -> None:
+        # The buy/sell this tick's on_tick() just returned never actually
+        # went through (blocked as inactive strategy, blocked by sentiment,
+        # or shrunk to zero) -- undo the owned_levels/last_trade_price
+        # mutation made when the signal was created, or this level stays
+        # permanently (and wrongly) marked as bought/sold.
+        if self._pending_signal is None:
+            return
+        level = self._pending_signal["level"]
+        if self._pending_signal["side"] == "buy":
+            self.owned_levels.discard(level)
+        else:
+            self.owned_levels.add(level)
+        self.last_trade_price = self._pending_signal["previous_trade_price"]
+        self._pending_signal = None

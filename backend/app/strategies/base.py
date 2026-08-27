@@ -38,6 +38,20 @@ class Strategy(ABC):
         and block/confuse its own future signals."""
         pass
 
+    def on_signal_not_filled(self) -> None:
+        """Called when the most recent buy signal this strategy returned
+        from on_tick() did NOT result in an actual purchase -- blocked
+        because this strategy wasn't the regime-selected active one,
+        blocked by a sentiment pause, or shrunk to zero by
+        correlation/concentration sizing. No-op by default; a strategy that
+        marks itself "in position" (grid adding a level to owned_levels,
+        trend/momentum setting in_position) at signal time rather than at
+        confirmed-fill time must override this to undo that mark --
+        otherwise it believes it holds something it was never actually
+        able to buy, and permanently refuses to reconsider that level/entry
+        even on a genuine future opportunity."""
+        pass
+
     def get_state(self) -> dict:
         """Generic snapshot of every instance attribute, so a strategy's
         memory (grid levels bought, moving-average history, ...) survives a
