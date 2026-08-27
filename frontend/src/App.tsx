@@ -413,6 +413,7 @@ function App() {
                     <th>Irány</th>
                     <th>Mennyiség</th>
                     <th>Ár</th>
+                    <th>Összeg</th>
                     <th>Díj</th>
                     <th>Indoklás</th>
                   </tr>
@@ -425,6 +426,7 @@ function App() {
                       <td>{trade.side}</td>
                       <td>{trade.qty.toFixed(6)}</td>
                       <td>{trade.price.toFixed(2)}</td>
+                      <td>{(trade.qty * trade.price).toFixed(2)} EUR</td>
                       <td>{trade.fee.toFixed(2)}</td>
                       <td>{trade.reason}</td>
                     </tr>
@@ -449,6 +451,7 @@ function App() {
                     <th>Coin</th>
                     <th>Stratégia</th>
                     <th>Irány</th>
+                    <th>Összeg</th>
                     <th>Kimenetel</th>
                     <th>Indoklás</th>
                   </tr>
@@ -460,6 +463,7 @@ function App() {
                       <td>{d.symbol}</td>
                       <td>{STRATEGY_LABELS[d.strategy] ?? d.strategy}</td>
                       <td>{d.side}</td>
+                      <td>{d.qty != null && d.price != null ? `${(d.qty * d.price).toFixed(2)} EUR` : "—"}</td>
                       <td className={OUTCOME_CLASS[d.outcome]}>
                         {OUTCOME_LABELS[d.outcome]}
                         {d.shrunk_pct ? ` (méret −${d.shrunk_pct}%)` : ""}

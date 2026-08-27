@@ -9,7 +9,15 @@ class TrendMomentumStrategy(Strategy):
     price trading above its own Bollinger middle band. Sells on a death
     cross, or when price closes back below the middle band (the trend has
     actually broken) -- not just because RSI got high, which a strong trend
-    can stay at for a long time while still going up."""
+    can stay at for a long time while still going up.
+
+    A cross only counts once fast and slow have actually separated by
+    min_cross_gap_pct -- without this, a fast/slow pair sitting almost
+    exactly on top of each other in a choppy market flips "golden"/"death"
+    on essentially rounding noise, buying and selling within minutes and
+    losing the round-trip to fees every time. Same fix pattern as grid's
+    min_move_pct hysteresis, applied to the cross instead of a price level.
+    """
 
     name = "trend_momentum"
 
@@ -23,6 +31,7 @@ class TrendMomentumStrategy(Strategy):
         bollinger_period: int = 20,
         order_size_fraction: float = 0.2,
         history_size: int = 50,
+        min_cross_gap_pct: float = 0.15,
     ):
         self.symbol = symbol
         self.fast_ma_period = fast_ma_period
@@ -31,6 +40,7 @@ class TrendMomentumStrategy(Strategy):
         self.rsi_extreme_overbought = rsi_extreme_overbought
         self.bollinger_period = bollinger_period
         self.order_size_fraction = order_size_fraction
+        self.min_cross_gap_pct = min_cross_gap_pct
         self.price_history: deque[float] = deque(maxlen=history_size)
         self.in_position = False
         # Set right before returning a buy/sell signal, so on_signal_not_filled
@@ -50,7 +60,8 @@ class TrendMomentumStrategy(Strategy):
         if fast is None or slow is None or current_rsi is None or middle_band is None:
             return []
 
-        golden_cross = fast > slow
+        cross_gap_pct = abs(fast - slow) / slow * 100 if slow else 0.0
+        golden_cross = fast > slow and cross_gap_pct >= self.min_cross_gap_pct
         above_middle_band = ctx.price > middle_band
         not_blow_off_top = current_rsi < self.rsi_extreme_overbought
 
@@ -66,7 +77,7 @@ class TrendMomentumStrategy(Strategy):
                 )
             ]
 
-        death_cross = fast < slow
+        death_cross = fast < slow and cross_gap_pct >= self.min_cross_gap_pct
         trend_broken = ctx.price < middle_band
 
         if (death_cross or trend_broken) and self.in_position:
