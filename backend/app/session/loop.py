@@ -25,8 +25,12 @@ REGIME_HISTORY_LENGTH = 30
 
 # How many recent decision-log entries to keep per session -- a rolling
 # diagnostic feed (see _log_decision), not durable state, so this resets on
-# a backend restart same as _strategy_instances below.
-DECISION_LOG_LENGTH = 200
+# a backend restart same as _strategy_instances below. Sized generously
+# (roughly a full night's worth of 30s ticks across 4 coins x up to 3
+# candidate strategies) rather than the minimum needed for a quick check,
+# so an overnight unattended run doesn't quietly roll off its early hours
+# before anyone's looked at it.
+DECISION_LOG_LENGTH = 5000
 
 # One strategy instance per (session, symbol, strategy). In auto mode all
 # three strategies for a symbol are kept ticking every cycle so their
