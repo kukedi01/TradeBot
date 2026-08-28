@@ -42,6 +42,17 @@ def kelly_fraction(win_pnls: list[float], loss_pnls: list[float], max_fraction: 
             "kelly_fraction": max_fraction if win_pnls else 0.0,
         }
 
+    if avg_win == 0:
+        # Only losses recorded, zero wins -- there's no edge to size up on
+        # (and reward_risk_ratio would otherwise be a division by zero).
+        return {
+            "win_rate": win_rate,
+            "avg_win": avg_win,
+            "avg_loss": avg_loss,
+            "reward_risk_ratio": 0.0,
+            "kelly_fraction": 0.0,
+        }
+
     reward_risk_ratio = avg_win / avg_loss
     loss_rate = 1 - win_rate
     full_kelly = win_rate - (loss_rate / reward_risk_ratio)

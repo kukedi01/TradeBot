@@ -18,7 +18,9 @@ python -m venv .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 .venv\Scripts\python.exe -m uvicorn app.main:app --port 8000 --reload --reload-dir app
 ```
-`--reload-dir app` matters: without it, uvicorn also watches `.venv/`, and any `pip install` inside it triggers a reload storm that can hang the reloader. No test suite exists yet. No linter/formatter is configured for the backend.
+`--reload-dir app` matters: without it, uvicorn also watches `.venv/`, and any `pip install` inside it triggers a reload storm that can hang the reloader. No linter/formatter is configured for the backend.
+
+A `backend/tests/` pytest suite covers the pure, high-risk financial logic (`fill_simulator`, `guardrails`, `correlation`, `volatility`, `position_sizing`, `indicators`, the `Grid`/`TrendMomentum` strategies, and a network-free smoke test of the backtest engine with synthetic candles) — run it with `.venv\Scripts\python.exe -m pytest` (`.venv/bin/python -m pytest` on macOS/Linux) from `backend/`. It intentionally does not cover `session/loop.py`'s live tick orchestration, the API routes, or anything that hits Kraken or the database directly — those are exercised manually against the running app instead. `requirements-dev.txt` adds `pytest` on top of `requirements.txt`.
 
 Frontend (from `frontend/`):
 ```
