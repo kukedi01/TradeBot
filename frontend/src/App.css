@@ -314,3 +314,76 @@ tbody tr:hover {
 .outcome-muted {
   color: var(--text-muted);
 }
+
+.coin-chart {
+  margin-bottom: 28px;
+}
+
+.coin-chart:last-child {
+  margin-bottom: 0;
+}
+
+.coin-chart-empty {
+  color: var(--text-muted);
+  font-size: 14px;
+  padding: 12px 0;
+}
+
+.coin-chart-header {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin-bottom: 4px;
+  font-family: var(--sans);
+}
+
+.coin-chart-header strong {
+  font-family: var(--display);
+  font-size: 14px;
+  letter-spacing: 0.6px;
+  color: var(--text-h);
+}
+
+.coin-chart-price {
+  font-family: var(--mono);
+  font-size: 13px;
+  color: var(--accent-2);
+}
+
+.coin-chart-svg {
+  width: 100%;
+  height: auto;
+}
+
+.chart-label {
+  font-family: var(--mono);
+  font-size: 9px;
+  fill: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.chart-ref-line {
+  stroke: var(--border);
+  stroke-width: 1;
+  stroke-dasharray: 3 3;
+}
+
+.chart-line-rsi {
+  stroke: var(--accent);
+  filter: drop-shadow(0 0 4px rgba(139, 92, 246, 0.6));
+}
+
+.volume-bar {
+  fill: var(--border);
+}
+
+.macd-hist-pos {
+  fill: var(--good);
+  opacity: 0.7;
+}
+
+.macd-hist-neg {
+  fill: var(--critical);
+  opacity: 0.7;
+}

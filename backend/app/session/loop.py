@@ -7,13 +7,14 @@ from sqlalchemy.orm import Session as DbSession
 from app.constants import TRADABLE_SYMBOLS
 from app.db.models import Portfolio, PortfolioSnapshot, TradingSession
 from app.execution.paper_executor import PaperExecutor
-from app.market_data.kraken_client import get_ticker_price
+from app.market_data.kraken_client import get_ticker_price, get_ticker_volume
 from app.news.reactor import get_sentiment_state
 from app.risk.correlation import correlation_size_multiplier, get_correlation_matrix
 from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
 from app.risk.position_sizing import compute_kelly_size_for_strategy
 from app.session.state_store import REGIME_HISTORY_KEY, load_state, save_state
 from app.strategies.base import Strategy, StrategyContext
+from app.strategies.indicators import macd_series, rsi_series
 from app.strategies.registry import STRATEGY_BUILDERS
 from app.strategies.regime import REGIME_STRATEGY, pick_strategy
 
@@ -45,6 +46,19 @@ _regime_state: dict[tuple[int, str], dict] = {}
 # *did* happen; this is what lets the frontend show why a strategy that
 # looked "active" still didn't trade.
 _decision_log: dict[int, deque[dict]] = {}
+# Same short rolling window as _price_histories, but kept for every session
+# regardless of auto/fixed mode (that one's only populated in auto mode,
+# for regime detection) -- purely for charting, so it's independent of
+# whatever the trading logic itself needs.
+_chart_histories: dict[tuple[int, str], deque[dict]] = {}
+# Kraken's ticker only exposes a rolling 24h volume total, which barely
+# moves tick to tick -- charting that raw level over a ~30-tick/15-minute
+# window would look almost perfectly flat. The delta between two
+# consecutive readings approximates how much actually traded in between,
+# which is what "volume" is supposed to show. Keyed separately (not just
+# read off the last chart-history entry) so it also works on the very
+# first tick after a restart, when there's no history yet to diff against.
+_last_raw_volume: dict[tuple[int, str], float] = {}
 
 
 # The APScheduler job never overlaps itself (max_instances=1 skips a cycle
@@ -102,6 +116,45 @@ def get_regime_state(session_id: int) -> list[dict]:
     ]
 
 
+def _record_chart_tick(session_id: int, symbol: str, price: float, raw_volume_24h: float) -> None:
+    key = (session_id, symbol)
+    previous = _last_raw_volume.get(key)
+    # Kraken's 24h counter resets/jumps occasionally (e.g. crossing a UTC
+    # day boundary) -- a negative delta there isn't a real volume of zero
+    # trades, it's just the counter rolling over, so floor at 0 either way.
+    volume_delta = max(raw_volume_24h - previous, 0.0) if previous is not None else 0.0
+    _last_raw_volume[key] = raw_volume_24h
+
+    if key not in _chart_histories:
+        _chart_histories[key] = deque(maxlen=REGIME_HISTORY_LENGTH)
+    _chart_histories[key].append(
+        {"timestamp": datetime.utcnow().isoformat(), "price": price, "volume": volume_delta}
+    )
+
+
+def get_chart_data(session_id: int) -> dict[str, dict]:
+    """Price/volume/indicator series for each tradable coin, over the same
+    short rolling window (see REGIME_HISTORY_LENGTH) the live strategies
+    themselves see -- not a separate, longer historical fetch. RSI and MACD
+    are computed fresh at every point in that window so they can be charted
+    as lines, not just a single latest value."""
+    result: dict[str, dict] = {}
+    for symbol in TRADABLE_SYMBOLS:
+        ticks = list(_chart_histories.get((session_id, symbol), []))
+        prices = [t["price"] for t in ticks]
+        macd_line, macd_signal, macd_hist = macd_series(prices)
+        result[symbol] = {
+            "timestamps": [t["timestamp"] for t in ticks],
+            "prices": prices,
+            "volumes": [t["volume"] for t in ticks],
+            "rsi": [float(v) if v is not None else None for v in rsi_series(prices)],
+            "macd": macd_line,
+            "macd_signal": macd_signal,
+            "macd_histogram": macd_hist,
+        }
+    return result
+
+
 def run_tick(db: DbSession, session_id: int) -> list[str]:
     lock = _tick_locks.setdefault(session_id, threading.Lock())
     if not lock.acquire(blocking=False):
@@ -127,6 +180,12 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
     # available, even for a buy signal on the first symbol in the loop.
     prices: dict[str, float] = {symbol: get_ticker_price(symbol) for symbol in TRADABLE_SYMBOLS}
     correlation_matrix = get_correlation_matrix(TRADABLE_SYMBOLS)
+    for symbol in TRADABLE_SYMBOLS:
+        try:
+            volume = get_ticker_volume(symbol)
+        except Exception:
+            volume = 0.0
+        _record_chart_tick(session_id, symbol, prices[symbol], volume)
 
     for symbol in TRADABLE_SYMBOLS:
         price = prices[symbol]

@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   getActiveSession,
+  getChartData,
   getDecisions,
   getNews,
   getRecommendation,
@@ -14,6 +15,7 @@ import {
   stopAllSessions,
   stopSession,
   tickNow,
+  type CoinChartData,
   type Decision,
   type NewsItem,
   type Recommendation,
@@ -23,8 +25,11 @@ import {
   type Trade,
   type TradingSession,
 } from "./api";
+import { CoinChart } from "./CoinChart";
 import { EquityChart } from "./EquityChart";
 import "./App.css";
+
+const TRADABLE_SYMBOLS = ["BTC/EUR", "ETH/EUR", "SOL/EUR", "XRP/EUR"];
 
 const RISK_LABELS: Record<string, string> = {
   low: "Alacsony",
@@ -73,6 +78,7 @@ function App() {
   const [regimeState, setRegimeState] = useState<RegimeEntry[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [decisions, setDecisions] = useState<Decision[]>([]);
+  const [chartData, setChartData] = useState<Record<string, CoinChartData>>({});
   const [riskLevel, setRiskLevel] = useState("medium");
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
   const [startingBalance, setStartingBalance] = useState(1000);
@@ -98,18 +104,21 @@ function App() {
   }, [riskLevel]);
 
   const refresh = async (sessionId: number) => {
-    const [updatedSession, updatedTrades, updatedRegime, updatedSnapshots, updatedDecisions] = await Promise.all([
-      getSession(sessionId),
-      getTrades(sessionId),
-      getRegimeState(sessionId),
-      getSnapshots(sessionId),
-      getDecisions(sessionId),
-    ]);
+    const [updatedSession, updatedTrades, updatedRegime, updatedSnapshots, updatedDecisions, updatedChartData] =
+      await Promise.all([
+        getSession(sessionId),
+        getTrades(sessionId),
+        getRegimeState(sessionId),
+        getSnapshots(sessionId),
+        getDecisions(sessionId),
+        getChartData(sessionId),
+      ]);
     setSession(updatedSession);
     setTrades(updatedTrades);
     setRegimeState(updatedRegime);
     setSnapshots(updatedSnapshots);
     setDecisions(updatedDecisions);
+    setChartData(updatedChartData);
   };
 
   useEffect(() => {
@@ -398,6 +407,16 @@ function App() {
           <section className="panel">
             <h2>Bot vs. HODL</h2>
             <EquityChart snapshots={snapshots} />
+          </section>
+
+          <section className="panel">
+            <h2>Piaci adatok coinonként</h2>
+            <p className="rationale">
+              Ugyanaz a rövid, ~30 tick-es árelőzmény, amit a stratégiák is látnak — nem hosszabb történelmi adat.
+            </p>
+            {TRADABLE_SYMBOLS.map((symbol) =>
+              chartData[symbol] ? <CoinChart key={symbol} symbol={symbol} data={chartData[symbol]} /> : null,
+            )}
           </section>
 
           <section className="panel">

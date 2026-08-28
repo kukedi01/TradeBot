@@ -15,7 +15,7 @@ from app.db.database import SessionLocal
 from app.db.models import Portfolio, PortfolioSnapshot, Trade, TradingSession
 from app.execution.paper_executor import PaperExecutor
 from app.session import manager
-from app.session.loop import get_decision_log, get_regime_state, run_tick
+from app.session.loop import get_chart_data, get_decision_log, get_regime_state, run_tick
 
 router = APIRouter(prefix="/session", tags=["session"])
 
@@ -157,6 +157,16 @@ def get_decisions(session_id: int, db: DbSession = Depends(get_db)):
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"decisions": get_decision_log(session_id)}
+
+
+@router.get("/{session_id}/chart-data")
+def get_chart_data_endpoint(session_id: int, db: DbSession = Depends(get_db)):
+    """Price/volume/RSI/MACD series per coin, over the same short rolling
+    window the live strategies themselves see (see loop.get_chart_data)."""
+    session = manager.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return get_chart_data(session_id)
 
 
 @router.post("/{session_id}/tick")

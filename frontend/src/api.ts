@@ -189,3 +189,18 @@ export async function getDecisions(sessionId: number): Promise<Decision[]> {
   const data = await res.json();
   return data.decisions;
 }
+
+export interface CoinChartData {
+  timestamps: string[];
+  prices: number[];
+  volumes: number[];
+  rsi: (number | null)[];
+  macd: (number | null)[];
+  macd_signal: (number | null)[];
+  macd_histogram: (number | null)[];
+}
+
+export async function getChartData(sessionId: number): Promise<Record<string, CoinChartData>> {
+  const res = await fetch(`${API_BASE}/session/${sessionId}/chart-data`);
+  return res.json();
+}
