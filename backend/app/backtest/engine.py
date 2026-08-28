@@ -54,7 +54,9 @@ def _run_auto(symbol: str, candles: list[list], starting_balance_usd: float) -> 
         price_history.append(close)
         active_strategy_name, previous_regime = pick_strategy(list(price_history), previous_regime)
 
-        ctx = StrategyContext(symbol=symbol, price=close, cash_usd=cash_usd, holdings={base_asset: held_qty})
+        ctx = StrategyContext(
+            symbol=symbol, price=close, cash_usd=cash_usd, holdings={base_asset: held_qty}, volume=candle[5]
+        )
 
         for strategy_name, strategy in strategies.items():
             for signal in strategy.on_tick(ctx):
@@ -121,7 +123,9 @@ def run_backtest(strategy_name: str, symbol: str, candles: list[list], starting_
 
     for candle in candles:
         close = candle[4]
-        ctx = StrategyContext(symbol=symbol, price=close, cash_usd=cash_usd, holdings={base_asset: held_qty})
+        ctx = StrategyContext(
+            symbol=symbol, price=close, cash_usd=cash_usd, holdings={base_asset: held_qty}, volume=candle[5]
+        )
         signals = strategy.on_tick(ctx)
 
         for signal in signals:
@@ -250,6 +254,7 @@ def run_multi_coin_backtest(
 
     for step in range(step_count):
         prices = {symbol: aligned[symbol][step][4] for symbol in symbols}
+        volumes = {symbol: aligned[symbol][step][5] for symbol in symbols}
 
         if not stopped:
             for symbol in symbols:
@@ -294,7 +299,9 @@ def run_multi_coin_backtest(
                                 if key in strategies:
                                     strategies[key].on_external_sell()
 
-                ctx = StrategyContext(symbol=symbol, price=price, cash_usd=cash_usd, holdings=dict(holdings))
+                ctx = StrategyContext(
+                    symbol=symbol, price=price, cash_usd=cash_usd, holdings=dict(holdings), volume=volumes[symbol]
+                )
 
                 for name in candidate_names:
                     strategy = get_strategy(symbol, name, price)

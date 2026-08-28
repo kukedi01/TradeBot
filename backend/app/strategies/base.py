@@ -20,6 +20,11 @@ class StrategyContext:
     holdings: dict
     pause_new_entries: bool = False
     size_multiplier: float = 1.0
+    # Live: the tick-to-tick delta of Kraken's 24h volume counter (see
+    # session/loop.py's _record_chart_tick). Backtest: the OHLCV candle's
+    # own volume field. Defaults to 0.0 for strategies/callers that don't
+    # care about it -- only trend/momentum currently reads this.
+    volume: float = 0.0
 
 
 class Strategy(ABC):

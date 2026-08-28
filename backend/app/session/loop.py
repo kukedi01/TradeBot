@@ -116,15 +116,19 @@ def get_regime_state(session_id: int) -> list[dict]:
     ]
 
 
-def _record_chart_tick(session_id: int, symbol: str, price: float, raw_volume_24h: float) -> None:
+def _volume_delta(session_id: int, symbol: str, raw_volume_24h: float) -> float:
     key = (session_id, symbol)
     previous = _last_raw_volume.get(key)
     # Kraken's 24h counter resets/jumps occasionally (e.g. crossing a UTC
     # day boundary) -- a negative delta there isn't a real volume of zero
     # trades, it's just the counter rolling over, so floor at 0 either way.
-    volume_delta = max(raw_volume_24h - previous, 0.0) if previous is not None else 0.0
+    delta = max(raw_volume_24h - previous, 0.0) if previous is not None else 0.0
     _last_raw_volume[key] = raw_volume_24h
+    return delta
 
+
+def _record_chart_tick(session_id: int, symbol: str, price: float, volume_delta: float) -> None:
+    key = (session_id, symbol)
     if key not in _chart_histories:
         _chart_histories[key] = deque(maxlen=REGIME_HISTORY_LENGTH)
     _chart_histories[key].append(
@@ -180,12 +184,14 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
     # available, even for a buy signal on the first symbol in the loop.
     prices: dict[str, float] = {symbol: get_ticker_price(symbol) for symbol in TRADABLE_SYMBOLS}
     correlation_matrix = get_correlation_matrix(TRADABLE_SYMBOLS)
+    volumes: dict[str, float] = {}
     for symbol in TRADABLE_SYMBOLS:
         try:
-            volume = get_ticker_volume(symbol)
+            raw_volume = get_ticker_volume(symbol)
         except Exception:
-            volume = 0.0
-        _record_chart_tick(session_id, symbol, prices[symbol], volume)
+            raw_volume = None
+        volumes[symbol] = _volume_delta(session_id, symbol, raw_volume) if raw_volume is not None else 0.0
+        _record_chart_tick(session_id, symbol, prices[symbol], volumes[symbol])
 
     for symbol in TRADABLE_SYMBOLS:
         price = prices[symbol]
@@ -253,6 +259,7 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
             holdings=portfolio.holdings or {},
             pause_new_entries=sentiment.pause_new_entries,
             size_multiplier=sentiment.size_multiplier,
+            volume=volumes[symbol],
         )
 
         for strategy_name in candidate_names:
