@@ -3,6 +3,7 @@ from collections import deque
 from app.execution.fill_simulator import simulate_fill
 from app.risk.correlation import compute_correlation_matrix_from_returns, correlation_size_multiplier, returns_from_closes
 from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
+from app.risk.volatility import volatility_size_multiplier
 from app.strategies.base import StrategyContext
 from app.strategies.registry import STRATEGY_BUILDERS
 from app.strategies.regime import pick_strategy
@@ -63,7 +64,10 @@ def _run_auto(symbol: str, candles: list[list], starting_balance_usd: float) -> 
                 if signal.side == "buy" and strategy_name != active_strategy_name:
                     strategy.on_signal_not_filled()
                     continue
-                fill_price, qty, fee = simulate_fill(close, signal.side, signal.size_fraction, cash_usd, held_qty)
+                size_fraction = signal.size_fraction
+                if signal.side == "buy":
+                    size_fraction *= volatility_size_multiplier(list(price_history))
+                fill_price, qty, fee = simulate_fill(close, signal.side, size_fraction, cash_usd, held_qty)
                 if qty <= 0:
                     strategy.on_signal_not_filled()
                     continue
@@ -115,6 +119,7 @@ def run_backtest(strategy_name: str, symbol: str, candles: list[list], starting_
     cash_usd = starting_balance_usd
     held_qty = 0.0
     avg_cost = 0.0
+    price_history: deque[float] = deque(maxlen=REGIME_HISTORY_LENGTH)
 
     equity_curve = []
     trade_log = []
@@ -123,13 +128,17 @@ def run_backtest(strategy_name: str, symbol: str, candles: list[list], starting_
 
     for candle in candles:
         close = candle[4]
+        price_history.append(close)
         ctx = StrategyContext(
             symbol=symbol, price=close, cash_usd=cash_usd, holdings={base_asset: held_qty}, volume=candle[5]
         )
         signals = strategy.on_tick(ctx)
 
         for signal in signals:
-            fill_price, qty, fee = simulate_fill(close, signal.side, signal.size_fraction, cash_usd, held_qty)
+            size_fraction = signal.size_fraction
+            if signal.side == "buy":
+                size_fraction *= volatility_size_multiplier(list(price_history))
+            fill_price, qty, fee = simulate_fill(close, signal.side, size_fraction, cash_usd, held_qty)
             if qty <= 0:
                 strategy.on_signal_not_filled()
                 continue
@@ -315,6 +324,9 @@ def run_multi_coin_backtest(
                             size_fraction *= concentration_size_multiplier(
                                 symbol, size_fraction, cash_usd, holdings, prices
                             )
+                            window_start = max(0, step + 1 - REGIME_HISTORY_LENGTH)
+                            recent_closes = [c[4] for c in aligned[symbol][window_start : step + 1]]
+                            size_fraction *= volatility_size_multiplier(recent_closes)
                         held_qty = holdings.get(base_asset, 0)
                         fill_price, qty, fee = simulate_fill(price, signal.side, size_fraction, cash_usd, held_qty)
                         if qty <= 0:

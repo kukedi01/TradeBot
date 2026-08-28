@@ -13,6 +13,7 @@ from app.notifications import send_desktop_notification
 from app.risk.correlation import correlation_size_multiplier, get_correlation_matrix
 from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
 from app.risk.position_sizing import compute_kelly_size_for_strategy
+from app.risk.volatility import volatility_size_multiplier
 from app.session.state_store import REGIME_HISTORY_KEY, load_state, save_state
 from app.strategies.base import Strategy, StrategyContext
 from app.strategies.indicators import macd_series, rsi_series
@@ -135,6 +136,10 @@ def _record_chart_tick(session_id: int, symbol: str, price: float, volume_delta:
     _chart_histories[key].append(
         {"timestamp": datetime.utcnow().isoformat(), "price": price, "volume": volume_delta}
     )
+
+
+def _recent_prices(session_id: int, symbol: str) -> list[float]:
+    return [t["price"] for t in _chart_histories.get((session_id, symbol), [])]
 
 
 def get_chart_data(session_id: int) -> dict[str, dict]:
@@ -302,6 +307,9 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     size_fraction *= concentration_size_multiplier(
                         signal.symbol, size_fraction, portfolio.cash_usd, portfolio.holdings or {}, prices
                     )
+                    # Choppier-than-usual right now -> smaller bet; calmer
+                    # than usual -> a somewhat bigger one.
+                    size_fraction *= volatility_size_multiplier(_recent_prices(session_id, signal.symbol))
                 fill = executor.place_order(signal.symbol, signal.side, size_fraction, signal.reason)
                 if fill is None:
                     _log_decision(session_id, {**log_base, "outcome": "zero_after_sizing"})
