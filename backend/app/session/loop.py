@@ -9,6 +9,7 @@ from app.db.models import Portfolio, PortfolioSnapshot, TradingSession
 from app.execution.paper_executor import PaperExecutor
 from app.market_data.kraken_client import get_ticker_price, get_ticker_volume
 from app.news.reactor import get_sentiment_state
+from app.notifications import send_desktop_notification
 from app.risk.correlation import correlation_size_multiplier, get_correlation_matrix
 from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
 from app.risk.position_sizing import compute_kelly_size_for_strategy
@@ -330,6 +331,10 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
     if session.status == "running":
         if session.target_balance is not None and total_value >= session.target_balance:
             session.status = "target_reached"
+            send_desktop_notification(
+                "🎯 Célösszeg elérve",
+                f"Session #{session_id}: {total_value:.2f} EUR (cél: {session.target_balance:.2f} EUR)",
+            )
         else:
             past_values = [
                 row[0]
@@ -340,6 +345,10 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
             risk_check = check_drawdown_limit(total_value, past_values, session.max_drawdown_pct)
             if risk_check.breached:
                 session.status = "risk_stopped"
+                send_desktop_notification(
+                    "🛑 Vészleállás",
+                    f"Session #{session_id} leállt: {risk_check.drawdown_pct:.1f}%-os visszaesés a csúcsértéktől",
+                )
 
     db.commit()
     return executed
