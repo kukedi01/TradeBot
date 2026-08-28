@@ -17,6 +17,13 @@ class TrendMomentumStrategy(Strategy):
     on essentially rounding noise, buying and selling within minutes and
     losing the round-trip to fees every time. Same fix pattern as grid's
     min_move_pct hysteresis, applied to the cross instead of a price level.
+
+    "Am I in a position" is read fresh from ctx.holdings every tick rather
+    than cached on self -- a cached flag can only be set speculatively (at
+    signal time, before the trade is known to have actually filled) and
+    desync from the real portfolio if that signal gets blocked or shrunk to
+    zero, which is exactly what left this strategy stuck retrying a sell of
+    a position it never actually held, every tick, indefinitely.
     """
 
     name = "trend_momentum"
@@ -42,11 +49,6 @@ class TrendMomentumStrategy(Strategy):
         self.order_size_fraction = order_size_fraction
         self.min_cross_gap_pct = min_cross_gap_pct
         self.price_history: deque[float] = deque(maxlen=history_size)
-        self.in_position = False
-        # Set right before returning a buy/sell signal, so on_signal_not_filled
-        # can undo the speculative in_position flip if the signal never
-        # actually results in a fill (see that method).
-        self._pending_previous_in_position: bool | None = None
 
     def on_tick(self, ctx: StrategyContext) -> list[TradeSignal]:
         self.price_history.append(ctx.price)
@@ -60,14 +62,15 @@ class TrendMomentumStrategy(Strategy):
         if fast is None or slow is None or current_rsi is None or middle_band is None:
             return []
 
+        base_asset = self.symbol.split("/")[0]
+        in_position = ctx.holdings.get(base_asset, 0) > 0
+
         cross_gap_pct = abs(fast - slow) / slow * 100 if slow else 0.0
         golden_cross = fast > slow and cross_gap_pct >= self.min_cross_gap_pct
         above_middle_band = ctx.price > middle_band
         not_blow_off_top = current_rsi < self.rsi_extreme_overbought
 
-        if golden_cross and above_middle_band and not_blow_off_top and not self.in_position:
-            self._pending_previous_in_position = self.in_position
-            self.in_position = True
+        if golden_cross and above_middle_band and not_blow_off_top and not in_position:
             return [
                 TradeSignal(
                     symbol=self.symbol,
@@ -80,9 +83,7 @@ class TrendMomentumStrategy(Strategy):
         death_cross = fast < slow and cross_gap_pct >= self.min_cross_gap_pct
         trend_broken = ctx.price < middle_band
 
-        if (death_cross or trend_broken) and self.in_position:
-            self._pending_previous_in_position = self.in_position
-            self.in_position = False
+        if (death_cross or trend_broken) and in_position:
             reason = "death cross" if death_cross else f"price fell below Bollinger middle band ({middle_band:.2f})"
             return [
                 TradeSignal(
@@ -94,20 +95,3 @@ class TrendMomentumStrategy(Strategy):
             ]
 
         return []
-
-    def on_external_sell(self) -> None:
-        # A stop-loss liquidation outside this strategy's own logic still
-        # closes the position -- without this, in_position would stay True
-        # until a death cross or band break happens to occur too, blocking
-        # any new buy signal in the meantime even though nothing is held.
-        self.in_position = False
-
-    def on_signal_not_filled(self) -> None:
-        # The buy/sell this tick's on_tick() just returned never actually
-        # went through -- undo the speculative in_position flip made when
-        # the signal was created, or this strategy believes it holds (or
-        # doesn't hold) a position that was never actually opened/closed.
-        if self._pending_previous_in_position is None:
-            return
-        self.in_position = self._pending_previous_in_position
-        self._pending_previous_in_position = None

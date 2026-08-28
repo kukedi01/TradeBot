@@ -33,9 +33,12 @@ class Strategy(ABC):
         """Called when a position gets closed outside this strategy's own
         on_tick logic (e.g. the position-level stop-loss guardrail
         liquidates it). No-op by default; a strategy that tracks "am I in a
-        position" internally (grid's owned levels, trend/momentum's
-        in_position flag) must override this so that state doesn't go stale
-        and block/confuse its own future signals."""
+        position" internally with state that isn't re-derived from
+        ctx.holdings every tick (grid's owned levels) must override this so
+        that state doesn't go stale and block/confuse its own future
+        signals. A strategy that reads ctx.holdings fresh each tick instead
+        (trend/momentum, dca_rebalance) needs no override -- it self-corrects
+        automatically the moment holdings actually change."""
         pass
 
     def on_signal_not_filled(self) -> None:
@@ -44,12 +47,14 @@ class Strategy(ABC):
         because this strategy wasn't the regime-selected active one,
         blocked by a sentiment pause, or shrunk to zero by
         correlation/concentration sizing. No-op by default; a strategy that
-        marks itself "in position" (grid adding a level to owned_levels,
-        trend/momentum setting in_position) at signal time rather than at
-        confirmed-fill time must override this to undo that mark --
-        otherwise it believes it holds something it was never actually
-        able to buy, and permanently refuses to reconsider that level/entry
-        even on a genuine future opportunity."""
+        marks itself "in position" at signal time rather than at
+        confirmed-fill time (grid adding a level to owned_levels) must
+        override this to undo that mark -- otherwise it believes it holds
+        something it was never actually able to buy, and permanently
+        refuses to reconsider that level/entry even on a genuine future
+        opportunity. Prefer deriving "in position" from ctx.holdings each
+        tick instead where the strategy's state allows it (see
+        TrendMomentumStrategy) -- it needs no such hook at all then."""
         pass
 
     def get_state(self) -> dict:

@@ -179,9 +179,9 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                         },
                     )
                     # The strategies ticking this symbol don't know their
-                    # position just got closed out from under them --
-                    # without this, e.g. trend/momentum's in_position flag
-                    # would stay stale and block a legitimate new buy later.
+                    # position just got closed out from under them -- without
+                    # this, e.g. grid's owned_levels would stay stale and
+                    # block a legitimate re-buy later.
                     for strategy_name in candidate_names:
                         key = (session_id, symbol, strategy_name)
                         if key in _strategy_instances:
