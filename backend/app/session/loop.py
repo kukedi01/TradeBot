@@ -1,4 +1,5 @@
 import threading
+import time
 from collections import deque
 from datetime import datetime
 
@@ -14,7 +15,7 @@ from app.risk.correlation import correlation_size_multiplier, get_correlation_ma
 from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
 from app.risk.position_sizing import compute_kelly_size_for_strategy
 from app.risk.volatility import volatility_size_multiplier
-from app.session.state_store import REGIME_HISTORY_KEY, load_state, save_state
+from app.session.state_store import POSITION_OWNER_KEY, REGIME_HISTORY_KEY, load_state, save_state
 from app.strategies.base import Strategy, StrategyContext
 from app.strategies.indicators import macd_series, rsi_series
 from app.strategies.registry import STRATEGY_BUILDERS
@@ -26,6 +27,12 @@ from app.strategies.regime import REGIME_STRATEGY, pick_strategy
 AUTO_STRATEGY = "auto"
 
 REGIME_HISTORY_LENGTH = 30
+# How many ticks the coin charts (price/volume/RSI/MACD) show -- deliberately
+# decoupled from REGIME_HISTORY_LENGTH, which is what the strategies
+# themselves actually see for regime detection. The charts exist for a human
+# to look at, so they can show more history than the trading logic uses
+# without changing any trading behavior. ~30s/tick, so 240 is ~2 hours.
+CHART_HISTORY_LENGTH = 240
 
 # How many recent decision-log entries to keep per session -- a rolling
 # diagnostic feed (see _log_decision), not durable state, so this resets on
@@ -61,6 +68,34 @@ _chart_histories: dict[tuple[int, str], deque[dict]] = {}
 # read off the last chart-history entry) so it also works on the very
 # first tick after a restart, when there's no history yet to diff against.
 _last_raw_volume: dict[tuple[int, str], float] = {}
+# Which strategy currently owns the open position on a symbol, set on a buy
+# fill and cleared once the position is fully closed. Without this, any
+# non-active strategy still ticking in the background (e.g. trend_momentum
+# reading grid's freshly-bought holdings as "my position") could sell it out
+# the moment its own unrelated exit condition fired -- closing a grid dip-buy
+# for a small loss within minutes, before grid's own exit ever got a chance.
+# Unknown (None) is treated permissively (sell allowed) so a position that
+# predates this feature, or survives a backend restart, doesn't get stranded.
+_position_owners: dict[tuple[int, str], str] = {}
+
+
+def _load_position_owner_if_needed(db: DbSession, session_id: int, symbol: str) -> None:
+    key = (session_id, symbol)
+    if key in _position_owners:
+        return
+    saved = load_state(db, session_id, symbol, POSITION_OWNER_KEY)
+    if saved and saved.get("owner"):
+        _position_owners[key] = saved["owner"]
+
+
+def _set_position_owner(db: DbSession, session_id: int, symbol: str, strategy_name: str) -> None:
+    _position_owners[(session_id, symbol)] = strategy_name
+    save_state(db, session_id, symbol, POSITION_OWNER_KEY, {"owner": strategy_name})
+
+
+def _clear_position_owner(db: DbSession, session_id: int, symbol: str) -> None:
+    _position_owners.pop((session_id, symbol), None)
+    save_state(db, session_id, symbol, POSITION_OWNER_KEY, {"owner": None})
 
 
 # The APScheduler job never overlaps itself (max_instances=1 skips a cycle
@@ -132,7 +167,7 @@ def _volume_delta(session_id: int, symbol: str, raw_volume_24h: float) -> float:
 def _record_chart_tick(session_id: int, symbol: str, price: float, volume_delta: float) -> None:
     key = (session_id, symbol)
     if key not in _chart_histories:
-        _chart_histories[key] = deque(maxlen=REGIME_HISTORY_LENGTH)
+        _chart_histories[key] = deque(maxlen=CHART_HISTORY_LENGTH)
     _chart_histories[key].append(
         {"timestamp": datetime.utcnow().isoformat(), "price": price, "volume": volume_delta}
     )
@@ -142,12 +177,53 @@ def _recent_prices(session_id: int, symbol: str) -> list[float]:
     return [t["price"] for t in _chart_histories.get((session_id, symbol), [])]
 
 
+# trend_momentum's moving-average periods (fast=5, slow=20) were backtested
+# against daily candles (a 150-day backtest hits Kraken's ~700-candle cap at
+# finer granularity, so pick_timeframe falls back to "1d"). Feeding it raw
+# 30s ticks instead made "5/20" mean 2.5/10 *minutes*, not days -- the
+# strategy was catching tick noise, not real trend, and round-tripping in
+# 5-10 minutes for a move too small to clear its own ~0.62% round-trip fee
+# and slippage cost. Aggregating live ticks into hourly candles and only
+# feeding trend_momentum a completed candle gives it a genuine multi-hour
+# trend concept again, matching what its parameters were actually validated
+# against in spirit (a real backtest is still daily; hourly is the practical
+# middle ground for a paper-trading session meant to be watched over hours,
+# not weeks).
+CANDLE_INTERVAL_SECONDS = 3600
+_candle_buckets: dict[tuple[int, str], dict] = {}
+
+
+def _update_candle(session_id: int, symbol: str, price: float, volume: float, now: datetime) -> dict | None:
+    """Feeds one raw tick into the current hourly OHLCV bucket for this
+    (session, symbol). Returns the just-closed candle when this tick crosses
+    into a new hour, else None -- the caller only acts on a closed candle."""
+    key = (session_id, symbol)
+    bucket_start = now.replace(minute=0, second=0, microsecond=0)
+    current = _candle_buckets.get(key)
+    if current is None or current["bucket_start"] != bucket_start:
+        _candle_buckets[key] = {
+            "bucket_start": bucket_start,
+            "open": price,
+            "high": price,
+            "low": price,
+            "close": price,
+            "volume": volume,
+        }
+        return current
+    current["high"] = max(current["high"], price)
+    current["low"] = min(current["low"], price)
+    current["close"] = price
+    current["volume"] += volume
+    return None
+
+
 def get_chart_data(session_id: int) -> dict[str, dict]:
-    """Price/volume/indicator series for each tradable coin, over the same
-    short rolling window (see REGIME_HISTORY_LENGTH) the live strategies
-    themselves see -- not a separate, longer historical fetch. RSI and MACD
-    are computed fresh at every point in that window so they can be charted
-    as lines, not just a single latest value."""
+    """Price/volume/indicator series for each tradable coin, over the chart's
+    own rolling window (see CHART_HISTORY_LENGTH) -- longer than what the
+    live strategies themselves see for regime detection (REGIME_HISTORY_LENGTH),
+    since this is for a human to look at, not a separate historical fetch.
+    RSI and MACD are computed fresh at every point in that window so they can
+    be charted as lines, not just a single latest value."""
     result: dict[str, dict] = {}
     for symbol in TRADABLE_SYMBOLS:
         ticks = list(_chart_histories.get((session_id, symbol), []))
@@ -165,13 +241,30 @@ def get_chart_data(session_id: int) -> dict[str, dict]:
     return result
 
 
+# A real tick (even a slow one, e.g. Kraken rate-limiting) finishes in well
+# under a minute. Holding the lock longer than this means the previous tick
+# is stuck, not slow -- e.g. a ccxt network call hanging forever on a
+# laptop sleep/wake cycle, which otherwise would block this session's
+# trading permanently since the lock never gets released.
+STUCK_TICK_SECONDS = 120
+_tick_lock_started_at: dict[int, float] = {}
+
+
 def run_tick(db: DbSession, session_id: int) -> list[str]:
     lock = _tick_locks.setdefault(session_id, threading.Lock())
     if not lock.acquire(blocking=False):
-        return []
+        started = _tick_lock_started_at.get(session_id)
+        if started is None or time.monotonic() - started < STUCK_TICK_SECONDS:
+            return []
+        # Abandon the stuck previous tick and take over.
+        lock.release()
+        if not lock.acquire(blocking=False):
+            return []
+    _tick_lock_started_at[session_id] = time.monotonic()
     try:
         return _run_tick_locked(db, session_id)
     finally:
+        _tick_lock_started_at.pop(session_id, None)
         lock.release()
 
 
@@ -229,6 +322,7 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
         # strategy signal this tick, using the weighted-average entry price
         # PaperExecutor tracks per asset.
         base_asset = symbol.split("/")[0]
+        _load_position_owner_if_needed(db, session_id, symbol)
         held_qty = (portfolio.holdings or {}).get(base_asset, 0)
         if held_qty > 0:
             avg_cost = (portfolio.cost_basis or {}).get(base_asset, 0.0)
@@ -257,7 +351,9 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                         key = (session_id, symbol, strategy_name)
                         if key in _strategy_instances:
                             _strategy_instances[key].on_external_sell()
+                    _clear_position_owner(db, session_id, symbol)
 
+        position_cost_basis = (portfolio.cost_basis or {}).get(base_asset, 0.0)
         ctx = StrategyContext(
             symbol=symbol,
             price=price,
@@ -266,11 +362,31 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
             pause_new_entries=sentiment.pause_new_entries,
             size_multiplier=sentiment.size_multiplier,
             volume=volumes[symbol],
+            cost_basis=position_cost_basis,
         )
+        closed_candle = _update_candle(session_id, symbol, price, volumes[symbol], datetime.utcnow())
 
         for strategy_name in candidate_names:
             strategy = _get_strategy(db, session_id, symbol, strategy_name)
-            signals = strategy.on_tick(ctx)
+            if strategy_name == "trend_momentum":
+                # Only reacts once an hourly candle actually closes -- see
+                # CANDLE_INTERVAL_SECONDS above for why raw 30s ticks aren't
+                # a real "trend" timeframe for this strategy.
+                if closed_candle is None:
+                    continue
+                strategy_ctx = StrategyContext(
+                    symbol=symbol,
+                    price=closed_candle["close"],
+                    cash_usd=portfolio.cash_usd,
+                    holdings=portfolio.holdings or {},
+                    pause_new_entries=sentiment.pause_new_entries,
+                    size_multiplier=sentiment.size_multiplier,
+                    cost_basis=position_cost_basis,
+                    volume=closed_candle["volume"],
+                )
+            else:
+                strategy_ctx = ctx
+            signals = strategy.on_tick(strategy_ctx)
             for signal in signals:
                 log_base = {"symbol": signal.symbol, "strategy": strategy_name, "side": signal.side, "reason": signal.reason}
 
@@ -280,8 +396,68 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                 # exit) always goes through. Otherwise a coin bought under a
                 # strategy that's no longer active could be stranded with no
                 # one left willing to sell it.
-                if signal.side == "buy" and strategy_name != active_strategy_name:
+                #
+                # trend_momentum's own buy signal is exempt from this gate:
+                # unlike grid (which has no internal noise filter and truly
+                # needs the regime gate), trend_momentum already requires a
+                # confirmed cross (min_cross_gap_pct), MACD agreement, and
+                # above-average volume on a real hourly candle before it
+                # ever proposes a buy -- a separate, cruder regime check (30
+                # raw ticks, ~15 minutes) can still be lagging behind a
+                # genuine hourly trend it has already confirmed. Live
+                # evidence: a fully-confirmed BTC golden cross got blocked
+                # here because the regime label hadn't flipped to
+                # "trending" yet, and price kept rising afterward -- a real
+                # missed entry, not a noise trade the gate correctly caught.
+                if (
+                    signal.side == "buy"
+                    and strategy_name != active_strategy_name
+                    and strategy_name != "trend_momentum"
+                ):
                     _log_decision(session_id, {**log_base, "outcome": "blocked_inactive_strategy"})
+                    strategy.on_signal_not_filled()
+                    continue
+                # A sell is allowed through from the position's actual owner
+                # (whichever strategy bought it) or from the currently active
+                # strategy (so a regime flip can still hand off the exit) --
+                # but not from some other inactive strategy that merely
+                # notices nonzero holdings and wants to close them out on its
+                # own unrelated exit condition. Unknown ownership (None) stays
+                # permissive, matching the pre-existing "never strand a
+                # position" behavior.
+                owner = _position_owners.get((session_id, signal.symbol))
+                if (
+                    signal.side == "sell"
+                    and owner is not None
+                    and strategy_name != owner
+                    and strategy_name != active_strategy_name
+                ):
+                    _log_decision(session_id, {**log_base, "outcome": "blocked_not_position_owner"})
+                    strategy.on_signal_not_filled()
+                    continue
+                # A regime-flip handoff sell (active strategy closing a
+                # position it didn't open) is only allowed at a real profit
+                # against the *original* owner's cost basis -- otherwise the
+                # new strategy's own (possibly unproven-on-this-coin) exit
+                # condition ends up unilaterally realizing a loss on a
+                # position it never had a thesis for. E.g. trend_momentum
+                # has no demonstrated edge on SOL/ETH/XRP in backtest, yet
+                # was repeatedly closing grid's patient, profit-seeking dip
+                # buys at a small loss the moment a regime flip made it
+                # "active" -- undoing exactly the discipline grid's own
+                # cost-basis check enforces on itself. The strategy's own
+                # position (strategy_name == owner) is exempt: cutting a
+                # losing trend fast is the whole point of trend-following,
+                # and the 12%/max-drawdown guardrails remain the backstop
+                # for a real breakdown either way.
+                if (
+                    signal.side == "sell"
+                    and owner is not None
+                    and strategy_name != owner
+                    and position_cost_basis > 0
+                    and price < position_cost_basis
+                ):
+                    _log_decision(session_id, {**log_base, "outcome": "blocked_handoff_below_cost_basis"})
                     strategy.on_signal_not_filled()
                     continue
                 # News sentiment only ever holds back or shrinks buys -- selling
@@ -320,6 +496,13 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                 if signal.side == "buy" and size_fraction < original_fraction * 0.99:
                     entry["shrunk_pct"] = round((1 - size_fraction / original_fraction) * 100, 1)
                 _log_decision(session_id, entry)
+
+                if signal.side == "buy":
+                    _set_position_owner(db, session_id, signal.symbol, strategy_name)
+                else:
+                    remaining = (portfolio.holdings or {}).get(base_asset, 0)
+                    if remaining <= 1e-9:
+                        _clear_position_owner(db, session_id, signal.symbol)
 
             # Saved after signal processing (not right after on_tick) so a
             # speculative owned_levels/in_position mutation that

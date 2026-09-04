@@ -1,15 +1,25 @@
 from app.backtest.data_loader import fetch_historical_ohlcv
 from app.backtest.engine import run_backtest
 
+# A strategy whose 150-day backtest shows a negative edge gets a raw Kelly
+# fraction of exactly 0.0 -- mathematically correct, but live it meant that
+# strategy could never place a real order at all. This floor keeps some size
+# on the table even for an unproven/losing edge, at the cost of accepting
+# more live risk than a strict Kelly gate would. Deliberately higher risk
+# tolerance than the pure Kelly math -- raise or lower to taste.
+MIN_LIVE_KELLY_FRACTION = 0.08
+
 
 def compute_kelly_size_for_strategy(strategy_name: str, symbol: str, days: int = 150) -> float:
-    """Runs a fresh backtest for the strategy and returns just the Kelly
-    fraction -- used to size live paper-trading orders instead of each
-    strategy's fixed default, so a strategy with no proven edge on recent
-    data trades smaller (or not at all) rather than betting blind."""
+    """Runs a fresh backtest for the strategy and returns the Kelly fraction,
+    floored at MIN_LIVE_KELLY_FRACTION -- used to size live paper-trading
+    orders instead of each strategy's fixed default, so a strategy with a
+    strong proven edge sizes up while one with a weak or negative edge still
+    trades small rather than being fully shut out."""
     candles = fetch_historical_ohlcv(symbol, days=days)
     result = run_backtest(strategy_name, symbol, candles)
-    return kelly_fraction(result["win_pnls"], result["loss_pnls"])["kelly_fraction"]
+    raw = kelly_fraction(result["win_pnls"], result["loss_pnls"])["kelly_fraction"]
+    return max(raw, MIN_LIVE_KELLY_FRACTION)
 
 
 def kelly_fraction(win_pnls: list[float], loss_pnls: list[float], max_fraction: float = 0.5) -> dict:

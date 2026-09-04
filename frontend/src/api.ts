@@ -176,6 +176,8 @@ export interface Decision {
   outcome:
     | "executed"
     | "blocked_inactive_strategy"
+    | "blocked_not_position_owner"
+    | "blocked_handoff_below_cost_basis"
     | "blocked_sentiment_pause"
     | "zero_after_sizing"
     | "stop_loss_triggered";

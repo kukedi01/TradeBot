@@ -6,6 +6,14 @@ from app.db.models import StrategyState
 # regime detection watches, which isn't owned by any one strategy.
 REGIME_HISTORY_KEY = "_regime_history"
 
+# Sentinel strategy_name used to persist which strategy currently owns the
+# open position on a symbol (see session/loop.py's _position_owners) -- a
+# backend restart wipes the in-memory dict, and without persisting it, every
+# position's ownership would revert to "unknown" (permissive) right after a
+# restart, letting any strategy sell it -- exactly the hijacking bug that
+# tracking ownership was meant to prevent in the first place.
+POSITION_OWNER_KEY = "_position_owner"
+
 
 def save_state(db: DbSession, session_id: int, symbol: str, strategy_name: str, state: dict) -> None:
     row = db.get(StrategyState, (session_id, symbol, strategy_name))

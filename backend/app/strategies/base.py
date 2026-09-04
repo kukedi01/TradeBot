@@ -25,6 +25,11 @@ class StrategyContext:
     # own volume field. Defaults to 0.0 for strategies/callers that don't
     # care about it -- only trend/momentum currently reads this.
     volume: float = 0.0
+    # The position's weighted-average entry price (Portfolio.cost_basis /
+    # the backtest engine's own avg_cost tracker), 0.0 if nothing is held.
+    # Only grid currently reads this, to avoid selling a level-up bounce
+    # that's still below what was actually paid for the whole position.
+    cost_basis: float = 0.0
 
 
 class Strategy(ABC):

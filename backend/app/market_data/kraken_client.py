@@ -1,6 +1,9 @@
 import ccxt
 
-kraken = ccxt.kraken()
+# Explicit timeout (ms) -- without one a hung connection (e.g. a laptop
+# sleep/wake cycle breaking an in-flight request) can block far longer than
+# is useful for a 30s trading tick.
+kraken = ccxt.kraken({"timeout": 15000})
 
 
 def get_ticker_price(symbol: str) -> float:

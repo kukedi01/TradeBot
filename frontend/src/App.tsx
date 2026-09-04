@@ -52,6 +52,8 @@ const STRATEGY_LABELS: Record<string, string> = {
 const OUTCOME_LABELS: Record<Decision["outcome"], string> = {
   executed: "Végrehajtva",
   blocked_inactive_strategy: "Blokkolva — nem az aktív stratégia",
+  blocked_not_position_owner: "Blokkolva — nem ő nyitotta a pozíciót",
+  blocked_handoff_below_cost_basis: "Blokkolva — átvétel a bekerülési ár alatt lenne",
   blocked_sentiment_pause: "Blokkolva — negatív hírhangulat",
   zero_after_sizing: "Elvetve — a méret nullára csökkent",
   stop_loss_triggered: "Stop-loss aktiválva",
@@ -60,6 +62,8 @@ const OUTCOME_LABELS: Record<Decision["outcome"], string> = {
 const OUTCOME_CLASS: Record<Decision["outcome"], string> = {
   executed: "outcome-good",
   blocked_inactive_strategy: "outcome-muted",
+  blocked_not_position_owner: "outcome-muted",
+  blocked_handoff_below_cost_basis: "outcome-muted",
   blocked_sentiment_pause: "outcome-warning",
   zero_after_sizing: "outcome-muted",
   stop_loss_triggered: "outcome-critical",
@@ -325,6 +329,25 @@ function App() {
               Session #{session.id} — {session.status} — {session.strategy_name}
             </h2>
             <p>Készpénz: {session.portfolio.cash_usd.toFixed(2)} EUR</p>
+            {snapshots.length > 0 && (
+              <p>
+                Teljes portfólió érték (készpénz + coinok jelenlegi árfolyamon):{" "}
+                <strong>{snapshots[snapshots.length - 1].total_value_eur.toFixed(2)} EUR</strong>
+                {" — ha egyszerűen tartottuk volna (HODL): "}
+                {snapshots[snapshots.length - 1].hodl_value_eur.toFixed(2)} EUR
+                {(() => {
+                  const latest = snapshots[snapshots.length - 1];
+                  const diffPct = ((latest.total_value_eur - latest.hodl_value_eur) / latest.hodl_value_eur) * 100;
+                  return (
+                    <span className={diffPct >= 0 ? "sentiment-positive-text" : "sentiment-negative-text"}>
+                      {" "}
+                      ({diffPct >= 0 ? "+" : ""}
+                      {diffPct.toFixed(2)}%)
+                    </span>
+                  );
+                })()}
+              </p>
+            )}
             {session.target_balance && <p>Célösszeg: {session.target_balance.toFixed(2)} EUR</p>}
             {session.max_drawdown_pct != null && <p>Vesztés-limit: {session.max_drawdown_pct}% a csúcsértéktől</p>}
             <p>
@@ -412,10 +435,17 @@ function App() {
           <section className="panel">
             <h2>Piaci adatok coinonként</h2>
             <p className="rationale">
-              Ugyanaz a rövid, ~30 tick-es árelőzmény, amit a stratégiák is látnak — nem hosszabb történelmi adat.
+Az elmúlt ~2 óra (240 tick) — ez csak a megjelenítést érinti, a stratégiák továbbra is a saját, rövidebb ablakukat használják a döntéshez.
             </p>
             {TRADABLE_SYMBOLS.map((symbol) =>
-              chartData[symbol] ? <CoinChart key={symbol} symbol={symbol} data={chartData[symbol]} /> : null,
+              chartData[symbol] ? (
+                <CoinChart
+                  key={symbol}
+                  symbol={symbol}
+                  data={chartData[symbol]}
+                  trades={trades.filter((t) => t.symbol === symbol)}
+                />
+              ) : null,
             )}
           </section>
 
