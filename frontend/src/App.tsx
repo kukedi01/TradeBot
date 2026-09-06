@@ -464,6 +464,7 @@ Az elmúlt ~2 óra (240 tick) — ez csak a megjelenítést érinti, a stratégi
                     <th>Ár</th>
                     <th>Összeg</th>
                     <th>Díj</th>
+                    <th>Eredmény</th>
                     <th>Indoklás</th>
                   </tr>
                 </thead>
@@ -477,6 +478,17 @@ Az elmúlt ~2 óra (240 tick) — ez csak a megjelenítést érinti, a stratégi
                       <td>{trade.price.toFixed(2)}</td>
                       <td>{(trade.qty * trade.price).toFixed(2)} EUR</td>
                       <td>{trade.fee.toFixed(2)}</td>
+                      <td>
+                        {trade.realized_pnl_pct == null ? (
+                          "—"
+                        ) : (
+                          <span className={trade.realized_pnl_pct >= 0 ? "sentiment-positive-text" : "sentiment-negative-text"}>
+                            {trade.realized_pnl_pct >= 0 ? "+" : ""}
+                            {trade.realized_pnl_pct.toFixed(2)}% ({trade.realized_pnl! >= 0 ? "+" : ""}
+                            {trade.realized_pnl!.toFixed(2)} EUR)
+                          </span>
+                        )}
+                      </td>
                       <td>{trade.reason}</td>
                     </tr>
                   ))}

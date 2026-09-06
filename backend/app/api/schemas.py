@@ -68,6 +68,12 @@ class TradeOut(BaseModel):
     price: float
     fee: float
     reason: Optional[str]
+    # Only set on a sell -- the realized profit/loss against the position's
+    # weighted-average cost basis at that moment, reconstructed by replaying
+    # the trade history (see list_trades). None on a buy, since a buy
+    # doesn't close anything yet.
+    realized_pnl: Optional[float] = None
+    realized_pnl_pct: Optional[float] = None
 
     class Config:
         from_attributes = True

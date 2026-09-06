@@ -39,7 +39,7 @@ class GridStrategy(Strategy):
         order_size_fraction: float = 0.1,
         recenter_after_ticks_out_of_range: int = 4,
         min_move_pct: float = 0.3,
-        min_profit_margin_pct: float = 0.5,
+        min_profit_margin_pct: float = 1.0,
     ):
         self.symbol = symbol
         self.lower_bound = lower_bound

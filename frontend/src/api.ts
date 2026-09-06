@@ -26,6 +26,8 @@ export interface Trade {
   price: number;
   fee: number;
   reason: string | null;
+  realized_pnl: number | null;
+  realized_pnl_pct: number | null;
 }
 
 export async function startSession(

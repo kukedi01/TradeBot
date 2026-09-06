@@ -124,8 +124,44 @@ def place_order(session_id: int, payload: OrderCreate, db: DbSession = Depends(g
 
 @router.get("/{session_id}/trades", response_model=list[TradeOut])
 def list_trades(session_id: int, db: DbSession = Depends(get_db)):
+    """Reconstructs each sell's realized P&L by replaying the trade history
+    with the same weighted-average cost-basis formula PaperExecutor uses
+    live -- computed here rather than stored on the Trade row, so no schema
+    change (and no cripto.db reset, losing existing history) is needed."""
     trades = db.query(Trade).filter(Trade.session_id == session_id).order_by(Trade.timestamp).all()
-    return trades
+    avg_cost: dict[str, float] = {}
+    held_qty: dict[str, float] = {}
+    result: list[TradeOut] = []
+    for t in trades:
+        base_asset = t.symbol.split("/")[0]
+        realized_pnl = None
+        realized_pnl_pct = None
+        prev_qty = held_qty.get(base_asset, 0.0)
+        if t.side == "buy":
+            prev_cost = avg_cost.get(base_asset, 0.0)
+            avg_cost[base_asset] = (prev_cost * prev_qty + t.price * t.qty) / (prev_qty + t.qty)
+            held_qty[base_asset] = prev_qty + t.qty
+        else:
+            cost = avg_cost.get(base_asset, 0.0)
+            realized_pnl = (t.price - cost) * t.qty - t.fee
+            if cost > 0:
+                realized_pnl_pct = (t.price - cost) / cost * 100
+            held_qty[base_asset] = prev_qty - t.qty
+        result.append(
+            TradeOut(
+                id=t.id,
+                timestamp=t.timestamp,
+                symbol=t.symbol,
+                side=t.side,
+                qty=t.qty,
+                price=t.price,
+                fee=t.fee,
+                reason=t.reason,
+                realized_pnl=realized_pnl,
+                realized_pnl_pct=realized_pnl_pct,
+            )
+        )
+    return result
 
 
 @router.get("/{session_id}/snapshots", response_model=list[SnapshotOut])
