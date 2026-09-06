@@ -34,6 +34,11 @@ REGIME_HISTORY_LENGTH = 30
 # without changing any trading behavior. ~30s/tick, so 240 is ~2 hours.
 CHART_HISTORY_LENGTH = 240
 
+# Same reasoning as grid's own min_profit_margin_pct: a handoff sell must
+# clear the position's cost basis by enough to still be a real profit after
+# the ~0.62% round-trip fee/slippage cost, not just by a hair.
+HANDOFF_MIN_PROFIT_MARGIN_PCT = 1.0
+
 # How many recent decision-log entries to keep per session -- a rolling
 # diagnostic feed (see _log_decision), not durable state, so this resets on
 # a backend restart same as _strategy_instances below. Sized generously
@@ -450,12 +455,19 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                 # losing trend fast is the whole point of trend-following,
                 # and the 12%/max-drawdown guardrails remain the backstop
                 # for a real breakdown either way.
+                #
+                # Requires the same margin grid's own sell uses, not just
+                # "strictly above cost basis" -- a raw price a hair above
+                # cost basis still nets a real loss once the ~0.26% sell
+                # fee (and slippage) are applied, which is exactly what let
+                # a trend_momentum handoff sell realize a small loss on XRP
+                # despite "clearing" a zero-margin check.
                 if (
                     signal.side == "sell"
                     and owner is not None
                     and strategy_name != owner
                     and position_cost_basis > 0
-                    and price < position_cost_basis
+                    and price < position_cost_basis * (1 + HANDOFF_MIN_PROFIT_MARGIN_PCT / 100)
                 ):
                     _log_decision(session_id, {**log_base, "outcome": "blocked_handoff_below_cost_basis"})
                     strategy.on_signal_not_filled()
