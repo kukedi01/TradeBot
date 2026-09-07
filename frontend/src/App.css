@@ -369,6 +369,13 @@ tbody tr:hover {
   stroke-dasharray: 3 3;
 }
 
+.daily-range-box {
+  fill: var(--bg-elevated, #1a1a2e);
+  stroke: var(--border);
+  stroke-width: 1;
+  rx: 4;
+}
+
 .chart-line-rsi {
   stroke: var(--accent);
   filter: drop-shadow(0 0 4px rgba(139, 92, 246, 0.6));

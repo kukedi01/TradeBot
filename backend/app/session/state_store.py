@@ -14,6 +14,13 @@ REGIME_HISTORY_KEY = "_regime_history"
 # tracking ownership was meant to prevent in the first place.
 POSITION_OWNER_KEY = "_position_owner"
 
+# Sentinel strategy_name used to persist the rolling 4-hour-candle close
+# history that trend_momentum's coarser trend-agreement filter watches (see
+# session/loop.py's _trend_4h_history) -- without this, a backend restart
+# would force a fresh ~80-hour (20 4h-candles) warmup before the filter could
+# confirm anything again, same reasoning as REGIME_HISTORY_KEY above.
+TREND_4H_HISTORY_KEY = "_trend_4h_history"
+
 
 def save_state(db: DbSession, session_id: int, symbol: str, strategy_name: str, state: dict) -> None:
     row = db.get(StrategyState, (session_id, symbol, strategy_name))

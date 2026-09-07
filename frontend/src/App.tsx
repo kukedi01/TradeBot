@@ -52,6 +52,7 @@ const STRATEGY_LABELS: Record<string, string> = {
 const OUTCOME_LABELS: Record<Decision["outcome"], string> = {
   executed: "Végrehajtva",
   blocked_inactive_strategy: "Blokkolva — nem az aktív stratégia",
+  blocked_4h_downtrend: "Blokkolva — 4h trend nem erősíti meg",
   blocked_not_position_owner: "Blokkolva — nem ő nyitotta a pozíciót",
   blocked_handoff_below_cost_basis: "Blokkolva — átvétel a bekerülési ár alatt lenne",
   blocked_sentiment_pause: "Blokkolva — negatív hírhangulat",
@@ -62,6 +63,7 @@ const OUTCOME_LABELS: Record<Decision["outcome"], string> = {
 const OUTCOME_CLASS: Record<Decision["outcome"], string> = {
   executed: "outcome-good",
   blocked_inactive_strategy: "outcome-muted",
+  blocked_4h_downtrend: "outcome-muted",
   blocked_not_position_owner: "outcome-muted",
   blocked_handoff_below_cost_basis: "outcome-muted",
   blocked_sentiment_pause: "outcome-warning",

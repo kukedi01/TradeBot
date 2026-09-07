@@ -22,7 +22,7 @@ def compute_kelly_size_for_strategy(strategy_name: str, symbol: str, days: int =
     return max(raw, MIN_LIVE_KELLY_FRACTION)
 
 
-def kelly_fraction(win_pnls: list[float], loss_pnls: list[float], max_fraction: float = 0.5) -> dict:
+def kelly_fraction(win_pnls: list[float], loss_pnls: list[float], max_fraction: float = 0.8) -> dict:
     """Simplified Kelly criterion: how much of the bankroll to risk per trade,
     given the strategy's own historical win rate and average win/loss size.
 
@@ -30,7 +30,12 @@ def kelly_fraction(win_pnls: list[float], loss_pnls: list[float], max_fraction: 
     and cap it at max_fraction, since the full Kelly formula assumes we know
     the true win rate exactly -- in reality it's just an estimate from a
     limited backtest, and overbetting on a noisy estimate is a fast way to
-    blow up an account.
+    blow up an account. max_fraction was raised from an initial 0.5 to 0.8
+    after a trend_momentum position-size sweep backtest (0.2 through 1.0)
+    showed every tradable coin's max drawdown staying under the 12% position
+    stop-loss up to roughly 0.8 -- still paper trading, so the appetite for
+    a bigger, still-backtest-checked position size is deliberately higher
+    than a live-money Kelly gate would normally allow.
     """
     total_trades = len(win_pnls) + len(loss_pnls)
     if total_trades == 0:

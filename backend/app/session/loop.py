@@ -15,9 +15,9 @@ from app.risk.correlation import correlation_size_multiplier, get_correlation_ma
 from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
 from app.risk.position_sizing import compute_kelly_size_for_strategy
 from app.risk.volatility import volatility_size_multiplier
-from app.session.state_store import POSITION_OWNER_KEY, REGIME_HISTORY_KEY, load_state, save_state
+from app.session.state_store import POSITION_OWNER_KEY, REGIME_HISTORY_KEY, TREND_4H_HISTORY_KEY, load_state, save_state
 from app.strategies.base import Strategy, StrategyContext
-from app.strategies.indicators import macd_series, rsi_series
+from app.strategies.indicators import macd_series, rsi_series, sma
 from app.strategies.registry import STRATEGY_BUILDERS
 from app.strategies.regime import REGIME_STRATEGY, pick_strategy
 
@@ -197,6 +197,25 @@ def _recent_prices(session_id: int, symbol: str) -> list[float]:
 CANDLE_INTERVAL_SECONDS = 3600
 _candle_buckets: dict[tuple[int, str], dict] = {}
 
+# A separate, coarser trend filter on top of the hourly golden cross above:
+# only let trend_momentum actually buy when the 4-hour timeframe is *also*
+# in an uptrend (its own fast/slow SMA agreeing), not just the 1h one. A
+# 29-day backtest comparing 1h-only vs. 1h+4h-agreement showed higher return,
+# higher win rate, and fewer/lower-quality trades on all 4 tradable coins --
+# the 4h view catches cases where an hourly cross fires against the larger
+# trend, which is disproportionately the losing half of trend_momentum's
+# trades. Applied as an external gate on the buy signal (like the regime/
+# ownership/sentiment checks in run_tick below), not inside the strategy
+# class itself, so the strategy's own confirmed-cross logic stays unchanged
+# and this filter can be tuned or dropped independently.
+CANDLE_4H_INTERVAL_SECONDS = 4 * 3600
+TREND_4H_FAST_PERIOD = 5
+TREND_4H_SLOW_PERIOD = 20
+TREND_4H_HISTORY_LENGTH = 30
+_candle_4h_buckets: dict[tuple[int, str], dict] = {}
+_trend_4h_history: dict[tuple[int, str], deque[float]] = {}
+_trend_4h_uptrend: dict[tuple[int, str], bool] = {}
+
 
 def _update_candle(session_id: int, symbol: str, price: float, volume: float, now: datetime) -> dict | None:
     """Feeds one raw tick into the current hourly OHLCV bucket for this
@@ -220,6 +239,46 @@ def _update_candle(session_id: int, symbol: str, price: float, volume: float, no
     current["close"] = price
     current["volume"] += volume
     return None
+
+
+def _update_4h_candle(session_id: int, symbol: str, price: float, now: datetime) -> dict | None:
+    """Same bucketing idea as _update_candle, on a 4-hour boundary (00/04/08/
+    12/16/20 UTC) instead of hourly. Only the close matters for the SMA
+    trend filter below, so this bucket doesn't bother tracking open/high/low."""
+    key = (session_id, symbol)
+    bucket_hour = (now.hour // 4) * 4
+    bucket_start = now.replace(hour=bucket_hour, minute=0, second=0, microsecond=0)
+    current = _candle_4h_buckets.get(key)
+    if current is None or current["bucket_start"] != bucket_start:
+        _candle_4h_buckets[key] = {"bucket_start": bucket_start, "close": price}
+        return current
+    current["close"] = price
+    return None
+
+
+def _load_4h_trend_if_needed(db: DbSession, session_id: int, symbol: str) -> None:
+    key = (session_id, symbol)
+    if key in _trend_4h_history:
+        return
+    saved = load_state(db, session_id, symbol, TREND_4H_HISTORY_KEY)
+    closes = saved["closes"] if saved else []
+    _trend_4h_history[key] = deque(closes, maxlen=TREND_4H_HISTORY_LENGTH)
+    if saved and saved.get("uptrend") is not None:
+        _trend_4h_uptrend[key] = saved["uptrend"]
+
+
+def _update_4h_trend(db: DbSession, session_id: int, symbol: str, closed_4h_close: float) -> None:
+    key = (session_id, symbol)
+    history = _trend_4h_history[key]
+    history.append(closed_4h_close)
+    prices = list(history)
+    fast = sma(prices, TREND_4H_FAST_PERIOD)
+    slow = sma(prices, TREND_4H_SLOW_PERIOD)
+    if fast is not None and slow is not None:
+        _trend_4h_uptrend[key] = fast > slow
+    save_state(
+        db, session_id, symbol, TREND_4H_HISTORY_KEY, {"closes": list(history), "uptrend": _trend_4h_uptrend.get(key)}
+    )
 
 
 def get_chart_data(session_id: int) -> dict[str, dict]:
@@ -370,6 +429,10 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
             cost_basis=position_cost_basis,
         )
         closed_candle = _update_candle(session_id, symbol, price, volumes[symbol], datetime.utcnow())
+        _load_4h_trend_if_needed(db, session_id, symbol)
+        closed_4h_candle = _update_4h_candle(session_id, symbol, price, datetime.utcnow())
+        if closed_4h_candle is not None:
+            _update_4h_trend(db, session_id, symbol, closed_4h_candle["close"])
 
         for strategy_name in candidate_names:
             strategy = _get_strategy(db, session_id, symbol, strategy_name)
@@ -420,6 +483,21 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     and strategy_name != "trend_momentum"
                 ):
                     _log_decision(session_id, {**log_base, "outcome": "blocked_inactive_strategy"})
+                    strategy.on_signal_not_filled()
+                    continue
+                # trend_momentum's own buy is exempt from the regime gate
+                # above, but still has to clear this coarser filter: the 4h
+                # timeframe's own fast/slow SMA must also be in an uptrend,
+                # not just the 1h one the strategy itself looks at. Unknown
+                # (not enough 4h history yet, e.g. right after session
+                # start) blocks rather than defaults open -- see
+                # CANDLE_4H_INTERVAL_SECONDS above for the backtest evidence.
+                if (
+                    signal.side == "buy"
+                    and strategy_name == "trend_momentum"
+                    and _trend_4h_uptrend.get((session_id, symbol)) is not True
+                ):
+                    _log_decision(session_id, {**log_base, "outcome": "blocked_4h_downtrend"})
                     strategy.on_signal_not_filled()
                     continue
                 # A sell is allowed through from the position's actual owner

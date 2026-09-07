@@ -1,4 +1,5 @@
-import type { CoinChartData, Trade } from "./api";
+import { useState } from "react";
+import { getDailyRange, type CoinChartData, type Trade } from "./api";
 
 const WIDTH = 640;
 const PADDING = 30;
@@ -62,13 +63,24 @@ function linePath(values: (number | null)[], min: number, max: number, yTop: num
   return path.trim();
 }
 
+type DailyRangeState = { status: "loading" } | { status: "error" } | { status: "loaded"; high: number; low: number };
+
 export function CoinChart({ symbol, data, trades }: { symbol: string; data: CoinChartData; trades: Trade[] }) {
+  const [dailyRange, setDailyRange] = useState<DailyRangeState | null>(null);
+
   if (data.prices.length < 2) {
     return (
       <div className="coin-chart-empty">
         <strong>{symbol}</strong> — még gyűlik az adat (kell pár tick).
       </div>
     );
+  }
+
+  function handlePriceClick() {
+    setDailyRange({ status: "loading" });
+    getDailyRange(symbol)
+      .then((r) => setDailyRange({ status: "loaded", high: r.high, low: r.low }))
+      .catch(() => setDailyRange({ status: "error" }));
   }
 
   const prices = data.prices;
@@ -121,6 +133,52 @@ export function CoinChart({ symbol, data, trades }: { symbol: string; data: Coin
       <svg viewBox={`0 0 ${WIDTH} ${TOTAL_HEIGHT}`} className="coin-chart-svg">
         {/* Price */}
         <path d={linePath(prices, priceMin, priceMax, PRICE_Y, PRICE_H)} className="chart-line chart-line-bot" />
+        <text x={WIDTH - PADDING} y={PRICE_Y + 9} textAnchor="end" className="chart-label">
+          {priceMax.toFixed(4)}
+        </text>
+        <text x={WIDTH - PADDING} y={PRICE_Y + PRICE_H - 2} textAnchor="end" className="chart-label">
+          {priceMin.toFixed(4)}
+        </text>
+
+        {/* Click anywhere on the price area to fetch today's real Kraken
+            high/low -- separate from priceMin/priceMax above, which are just
+            the min/max of this chart's own short rolling window. */}
+        <rect
+          x={PADDING}
+          y={PRICE_Y}
+          width={WIDTH - PADDING * 2}
+          height={PRICE_H}
+          fill="transparent"
+          style={{ cursor: "pointer" }}
+          onClick={handlePriceClick}
+        >
+          <title>Kattints a mai napi maximum/minimum árért</title>
+        </rect>
+        {dailyRange && (
+          <g onClick={() => setDailyRange(null)} style={{ cursor: "pointer" }}>
+            <rect x={PADDING} y={PRICE_Y + 4} width={150} height={dailyRange.status === "loaded" ? 34 : 18} className="daily-range-box" />
+            {dailyRange.status === "loading" && (
+              <text x={PADDING + 6} y={PRICE_Y + 16} className="chart-label">
+                Betöltés…
+              </text>
+            )}
+            {dailyRange.status === "error" && (
+              <text x={PADDING + 6} y={PRICE_Y + 16} className="chart-label">
+                Nem sikerült lekérni
+              </text>
+            )}
+            {dailyRange.status === "loaded" && (
+              <>
+                <text x={PADDING + 6} y={PRICE_Y + 16} className="chart-label">
+                  Napi max: {dailyRange.high.toFixed(4)} EUR
+                </text>
+                <text x={PADDING + 6} y={PRICE_Y + 30} className="chart-label">
+                  Napi min: {dailyRange.low.toFixed(4)} EUR
+                </text>
+              </>
+            )}
+          </g>
+        )}
 
         {/* Trade markers -- triangle pointing at the price point from the
             side that reads naturally: buys push up from below, sells press

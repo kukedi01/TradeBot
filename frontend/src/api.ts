@@ -178,6 +178,7 @@ export interface Decision {
   outcome:
     | "executed"
     | "blocked_inactive_strategy"
+    | "blocked_4h_downtrend"
     | "blocked_not_position_owner"
     | "blocked_handoff_below_cost_basis"
     | "blocked_sentiment_pause"
@@ -206,5 +207,16 @@ export interface CoinChartData {
 
 export async function getChartData(sessionId: number): Promise<Record<string, CoinChartData>> {
   const res = await fetch(`${API_BASE}/session/${sessionId}/chart-data`);
+  return res.json();
+}
+
+export interface DailyRange {
+  symbol: string;
+  high: number;
+  low: number;
+}
+
+export async function getDailyRange(symbol: string): Promise<DailyRange> {
+  const res = await fetch(`${API_BASE}/market/daily-range/${symbol}`);
   return res.json();
 }

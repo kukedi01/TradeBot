@@ -9,7 +9,7 @@ from app.api.routes_risk import router as risk_router
 from app.api.routes_session import router as session_router
 from app.api.routes_strategies import router as strategies_router
 from app.db.database import init_db
-from app.market_data.kraken_client import get_ticker_price
+from app.market_data.kraken_client import get_daily_high_low, get_ticker_price
 from app.scheduler import start_scheduler
 
 
@@ -38,3 +38,9 @@ app.include_router(news_router)
 def market_ticker(symbol: str):
     price = get_ticker_price(symbol)
     return {"symbol": symbol, "price": price}
+
+
+@app.get("/market/daily-range/{symbol:path}")
+def market_daily_range(symbol: str):
+    high, low = get_daily_high_low(symbol)
+    return {"symbol": symbol, "high": high, "low": low}
