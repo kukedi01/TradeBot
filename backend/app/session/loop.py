@@ -6,8 +6,9 @@ from datetime import datetime
 from sqlalchemy.orm import Session as DbSession
 
 from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT, TRADABLE_SYMBOLS
-from app.db.models import Portfolio, PortfolioSnapshot, TradingSession
+from app.db.models import MarketFlowSnapshot, Portfolio, PortfolioSnapshot, TradingSession
 from app.execution.paper_executor import PaperExecutor
+from app.market_data.flow import get_open_interest, get_volume_delta
 from app.market_data.kraken_client import get_ticker_price, get_ticker_volume
 from app.news.reactor import get_sentiment_state
 from app.notifications import send_desktop_notification
@@ -323,6 +324,49 @@ def get_chart_data(session_id: int) -> dict[str, dict]:
     return result
 
 
+def _record_market_flow(db: DbSession, symbol: str, price: float) -> None:
+    """Samples this symbol's order flow into market_flow_snapshots. Purely a
+    recording step -- nothing in the trading path reads it (see
+    market_data/flow.py for why it's collected at all).
+
+    Every failure mode is swallowed: the futures venue being down, Kraken
+    rate-limiting the trades endpoint, or anything else here must never cost
+    a trading tick. A gap in this dataset is an inconvenience; a tick that
+    didn't run is a missed trade.
+    """
+    try:
+        volume_delta, trade_count = get_volume_delta(symbol)
+    except Exception:
+        return
+
+    try:
+        open_interest = get_open_interest(symbol)
+    except Exception:
+        open_interest = None
+
+    previous = (
+        db.query(MarketFlowSnapshot.cumulative_volume_delta)
+        .filter(MarketFlowSnapshot.symbol == symbol)
+        .order_by(MarketFlowSnapshot.timestamp.desc())
+        .first()
+    )
+    # Seeded from the last stored row rather than an in-memory counter, so
+    # the running total survives the backend restarts this workflow does
+    # constantly instead of resetting to zero every time.
+    cumulative = (previous[0] if previous else 0.0) + volume_delta
+
+    db.add(
+        MarketFlowSnapshot(
+            symbol=symbol,
+            price=price,
+            volume_delta=volume_delta,
+            cumulative_volume_delta=cumulative,
+            trade_count=trade_count,
+            open_interest=open_interest,
+        )
+    )
+
+
 # A real tick (even a slow one, e.g. Kraken rate-limiting) finishes in well
 # under a minute. Holding the lock longer than this means the previous tick
 # is stuck, not slow -- e.g. a ccxt network call hanging forever on a
@@ -373,6 +417,7 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
             raw_volume = None
         volumes[symbol] = _volume_delta(session_id, symbol, raw_volume) if raw_volume is not None else 0.0
         _record_chart_tick(session_id, symbol, prices[symbol], volumes[symbol])
+        _record_market_flow(db, symbol, prices[symbol])
 
     for symbol in TRADABLE_SYMBOLS:
         price = prices[symbol]

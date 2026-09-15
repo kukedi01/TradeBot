@@ -80,6 +80,35 @@ class StrategyState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class MarketFlowSnapshot(Base):
+    """Order-flow readings sampled every tick: cumulative volume delta and
+    open interest (see market_data/flow.py). Deliberately keyed by symbol
+    rather than by session -- this is market data, not session data, so it
+    keeps accumulating across sessions and stays usable as one continuous
+    history to test hypotheses against later.
+
+    Nothing reads this yet. It exists because neither metric can be
+    backtested from anything Kraken serves retrospectively, so the only way
+    to ever evaluate them is to start recording now.
+    """
+
+    __tablename__ = "market_flow_snapshots"
+
+    id = Column(Integer, primary_key=True, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    symbol = Column(String, nullable=False, index=True)
+    price = Column(Float, nullable=False)
+    # Buy volume minus sell volume since the previous sample, and the running
+    # total of that -- the delta is what was measured, the cumulative is what
+    # the signal is actually read from.
+    volume_delta = Column(Float, nullable=False)
+    cumulative_volume_delta = Column(Float, nullable=False)
+    trade_count = Column(Integer, nullable=False, default=0)
+    # Nullable: the futures venue may not list this coin, or may be
+    # unreachable, and a missing reading must not stop the rest being kept.
+    open_interest = Column(Float, nullable=True)
+
+
 class StrategyPerformanceRecord(Base):
     __tablename__ = "strategy_performance_records"
 
