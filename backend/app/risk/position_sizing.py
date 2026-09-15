@@ -10,6 +10,25 @@ from app.backtest.engine import run_backtest
 MIN_LIVE_KELLY_FRACTION = 0.08
 
 
+def live_size_overrides(symbol: str, days: int = 150) -> dict[str, float]:
+    """Every strategy's live Kelly-derived order size for one symbol, shaped
+    for backtest/engine.py's size_fraction_override parameter -- so a
+    backtest can be run with the sizes a live session would actually use
+    instead of each strategy's hand-picked default (grid's live 0.8 vs its
+    own 0.1 default is an 8x gap, which is most of why "auto" backtests
+    looked so much less invested than the real bot).
+
+    Caveat worth keeping in mind: these are computed from the LAST `days`
+    days of data, so applying them to a backtest of an older window is a mild
+    look-ahead -- the sizes were informed by price action the backtested run
+    couldn't have seen yet. Fine for "how would today's bot have done",
+    misleading if read as a clean out-of-sample result.
+    """
+    from app.strategies.registry import STRATEGY_BUILDERS
+
+    return {name: compute_kelly_size_for_strategy(name, symbol, days) for name in STRATEGY_BUILDERS}
+
+
 def compute_kelly_size_for_strategy(strategy_name: str, symbol: str, days: int = 150) -> float:
     """Runs a fresh backtest for the strategy and returns the Kelly fraction,
     floored at MIN_LIVE_KELLY_FRACTION -- used to size live paper-trading

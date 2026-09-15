@@ -1,5 +1,5 @@
 import { useState } from "react";
-import { getDailyRange, type CoinChartData, type Trade } from "./api";
+import { getDailyRange, parseTimestamp, type CoinChartData, type Trade } from "./api";
 
 const WIDTH = 640;
 const PADDING = 30;
@@ -35,7 +35,7 @@ function nearestIndex(timestamps: string[], targetMs: number): number {
   let bestIndex = 0;
   let bestDiff = Infinity;
   timestamps.forEach((t, i) => {
-    const diff = Math.abs(new Date(t).getTime() - targetMs);
+    const diff = Math.abs(parseTimestamp(t).getTime() - targetMs);
     if (diff < bestDiff) {
       bestDiff = diff;
       bestIndex = i;
@@ -67,6 +67,7 @@ type DailyRangeState = { status: "loading" } | { status: "error" } | { status: "
 
 export function CoinChart({ symbol, data, trades }: { symbol: string; data: CoinChartData; trades: Trade[] }) {
   const [dailyRange, setDailyRange] = useState<DailyRangeState | null>(null);
+  const [hoverIndex, setHoverIndex] = useState<number | null>(null);
 
   if (data.prices.length < 2) {
     return (
@@ -83,6 +84,16 @@ export function CoinChart({ symbol, data, trades }: { symbol: string; data: Coin
       .catch(() => setDailyRange({ status: "error" }));
   }
 
+  function handlePriceMouseMove(e: React.MouseEvent<SVGRectElement>) {
+    const svg = e.currentTarget.ownerSVGElement;
+    if (!svg) return;
+    const rect = svg.getBoundingClientRect();
+    const mouseX = ((e.clientX - rect.left) / rect.width) * WIDTH;
+    const ratio = (mouseX - PADDING) / (WIDTH - PADDING * 2);
+    const index = Math.round(ratio * (data.prices.length - 1));
+    setHoverIndex(Math.max(0, Math.min(data.prices.length - 1, index)));
+  }
+
   const prices = data.prices;
   const priceMin = Math.min(...prices);
   const priceMax = Math.max(...prices);
@@ -91,15 +102,15 @@ export function CoinChart({ symbol, data, trades }: { symbol: string; data: Coin
   // Only trades that actually fall inside this chart's own rolling window
   // get a marker -- an older trade has already scrolled out of the ~30-tick
   // history the strategies themselves are looking at.
-  const windowStart = new Date(data.timestamps[0]).getTime();
-  const windowEnd = new Date(data.timestamps[data.timestamps.length - 1]).getTime();
+  const windowStart = parseTimestamp(data.timestamps[0]).getTime();
+  const windowEnd = parseTimestamp(data.timestamps[data.timestamps.length - 1]).getTime();
   const markers = trades
     .filter((t) => {
-      const ts = new Date(t.timestamp).getTime();
+      const ts = parseTimestamp(t.timestamp).getTime();
       return ts >= windowStart && ts <= windowEnd;
     })
     .map((t) => {
-      const index = nearestIndex(data.timestamps, new Date(t.timestamp).getTime());
+      const index = nearestIndex(data.timestamps, parseTimestamp(t.timestamp).getTime());
       const x = xFor(index, prices.length);
       const y = yFor(prices[index], priceMin, priceMax, PRICE_Y, PRICE_H);
       return { ...t, x, y };
@@ -151,9 +162,36 @@ export function CoinChart({ symbol, data, trades }: { symbol: string; data: Coin
           fill="transparent"
           style={{ cursor: "pointer" }}
           onClick={handlePriceClick}
+          onMouseMove={handlePriceMouseMove}
+          onMouseLeave={() => setHoverIndex(null)}
         >
           <title>Kattints a mai napi maximum/minimum árért</title>
         </rect>
+        {hoverIndex !== null &&
+          (() => {
+            const hx = xFor(hoverIndex, prices.length);
+            const hy = yFor(prices[hoverIndex], priceMin, priceMax, PRICE_Y, PRICE_H);
+            const timeLabel = parseTimestamp(data.timestamps[hoverIndex]).toLocaleTimeString("hu-HU", {
+              hour: "2-digit",
+              minute: "2-digit",
+              second: "2-digit",
+            });
+            const boxWidth = 100;
+            const boxX = Math.min(Math.max(hx - boxWidth / 2, PADDING), WIDTH - PADDING - boxWidth);
+            return (
+              <g style={{ pointerEvents: "none" }}>
+                <line x1={hx} x2={hx} y1={PRICE_Y} y2={PRICE_Y + PRICE_H} className="chart-ref-line" />
+                <circle cx={hx} cy={hy} r={3} className="chart-hover-dot" />
+                <rect x={boxX} y={PRICE_Y + PRICE_H - 32} width={boxWidth} height={30} className="daily-range-box" />
+                <text x={boxX + 6} y={PRICE_Y + PRICE_H - 20} className="chart-label">
+                  {prices[hoverIndex].toFixed(4)} EUR
+                </text>
+                <text x={boxX + 6} y={PRICE_Y + PRICE_H - 8} className="chart-label">
+                  {timeLabel}
+                </text>
+              </g>
+            );
+          })()}
         {dailyRange && (
           <g onClick={() => setDailyRange(null)} style={{ cursor: "pointer" }}>
             <rect x={PADDING} y={PRICE_Y + 4} width={150} height={dailyRange.status === "loaded" ? 34 : 18} className="daily-range-box" />

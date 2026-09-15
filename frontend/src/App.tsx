@@ -5,6 +5,7 @@ import {
   getDecisions,
   getNews,
   getRecommendation,
+  parseTimestamp,
   getRegimeState,
   getSentiment,
   getSession,
@@ -84,6 +85,7 @@ function App() {
   const [regimeState, setRegimeState] = useState<RegimeEntry[]>([]);
   const [snapshots, setSnapshots] = useState<Snapshot[]>([]);
   const [decisions, setDecisions] = useState<Decision[]>([]);
+  const [onlyExecutedBuys, setOnlyExecutedBuys] = useState(false);
   const [chartData, setChartData] = useState<Record<string, CoinChartData>>({});
   const [riskLevel, setRiskLevel] = useState("medium");
   const [recommendation, setRecommendation] = useState<Recommendation | null>(null);
@@ -473,7 +475,7 @@ Az elmúlt ~2 óra (240 tick) — ez csak a megjelenítést érinti, a stratégi
                 <tbody>
                   {trades.map((trade) => (
                     <tr key={trade.id}>
-                      <td>{new Date(trade.timestamp).toLocaleTimeString()}</td>
+                      <td>{parseTimestamp(trade.timestamp).toLocaleTimeString()}</td>
                       <td>{trade.symbol}</td>
                       <td>{trade.side}</td>
                       <td>{trade.qty.toFixed(6)}</td>
@@ -504,9 +506,26 @@ Az elmúlt ~2 óra (240 tick) — ez csak a megjelenítést érinti, a stratégi
               Nem csak a végrehajtott kötések — az is látszik, ha egy stratégia venni akart, de a rendszer blokkolta
               vagy lecsökkentette a méretét.
             </p>
-            {decisions.length === 0 ? (
-              <p style={{ marginTop: 12 }}>Még nincs döntési esemény.</p>
-            ) : (
+            <label style={{ display: "flex", alignItems: "center", gap: 6, marginTop: 8, cursor: "pointer" }}>
+              <input
+                type="checkbox"
+                checked={onlyExecutedBuys}
+                onChange={(e) => setOnlyExecutedBuys(e.target.checked)}
+              />
+              Csak a ténylegesen megtörtént vételek
+            </label>
+            {(() => {
+              const filteredDecisions = onlyExecutedBuys
+                ? decisions.filter((d) => d.outcome === "executed" && d.side === "buy")
+                : decisions;
+              if (filteredDecisions.length === 0) {
+                return (
+                  <p style={{ marginTop: 12 }}>
+                    {onlyExecutedBuys ? "Még nem történt tényleges vétel." : "Még nincs döntési esemény."}
+                  </p>
+                );
+              }
+              return (
               <table style={{ marginTop: 12 }}>
                 <thead>
                   <tr>
@@ -520,9 +539,9 @@ Az elmúlt ~2 óra (240 tick) — ez csak a megjelenítést érinti, a stratégi
                   </tr>
                 </thead>
                 <tbody>
-                  {decisions.slice(0, 30).map((d, i) => (
+                  {filteredDecisions.slice(0, 30).map((d, i) => (
                     <tr key={i}>
-                      <td>{new Date(d.timestamp).toLocaleTimeString()}</td>
+                      <td>{parseTimestamp(d.timestamp).toLocaleTimeString()}</td>
                       <td>{d.symbol}</td>
                       <td>{STRATEGY_LABELS[d.strategy] ?? d.strategy}</td>
                       <td>{d.side}</td>
@@ -536,7 +555,8 @@ Az elmúlt ~2 óra (240 tick) — ez csak a megjelenítést érinti, a stratégi
                   ))}
                 </tbody>
               </table>
-            )}
+              );
+            })()}
           </section>
         </>
       )}

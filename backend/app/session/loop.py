@@ -5,7 +5,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session as DbSession
 
-from app.constants import TRADABLE_SYMBOLS
+from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT, TRADABLE_SYMBOLS
 from app.db.models import Portfolio, PortfolioSnapshot, TradingSession
 from app.execution.paper_executor import PaperExecutor
 from app.market_data.kraken_client import get_ticker_price, get_ticker_volume
@@ -33,11 +33,6 @@ REGIME_HISTORY_LENGTH = 30
 # to look at, so they can show more history than the trading logic uses
 # without changing any trading behavior. ~30s/tick, so 240 is ~2 hours.
 CHART_HISTORY_LENGTH = 240
-
-# Same reasoning as grid's own min_profit_margin_pct: a handoff sell must
-# clear the position's cost basis by enough to still be a real profit after
-# the ~0.62% round-trip fee/slippage cost, not just by a hair.
-HANDOFF_MIN_PROFIT_MARGIN_PCT = 1.0
 
 # How many recent decision-log entries to keep per session -- a rolling
 # diagnostic feed (see _log_decision), not durable state, so this resets on

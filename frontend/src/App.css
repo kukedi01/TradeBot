@@ -369,6 +369,12 @@ tbody tr:hover {
   stroke-dasharray: 3 3;
 }
 
+.chart-hover-dot {
+  fill: var(--series-bot);
+  stroke: var(--bg-elevated, #1a1a2e);
+  stroke-width: 1;
+}
+
 .daily-range-box {
   fill: var(--bg-elevated, #1a1a2e);
   stroke: var(--border);

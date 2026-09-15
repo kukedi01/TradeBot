@@ -1,5 +1,13 @@
 const API_BASE = "http://127.0.0.1:8000";
 
+// Backend timestamps are UTC (Python's datetime.utcnow().isoformat() / naive
+// DateTime columns) but serialized without a timezone suffix. Without "Z",
+// the browser's Date parser treats the string as local time, shifting every
+// displayed time by the viewer's own UTC offset (2h early/late in CET/CEST).
+export function parseTimestamp(ts: string): Date {
+  return new Date(ts.endsWith("Z") || ts.includes("+") ? ts : `${ts}Z`);
+}
+
 export interface Portfolio {
   cash_usd: number;
   holdings: Record<string, number>;

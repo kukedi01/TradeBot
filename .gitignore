@@ -6,3 +6,8 @@ backend/.env
 
 # Claude Code local settings (machine-specific)
 .claude/settings.local.json
+
+# Local dev-server launcher scripts (machine-specific paths, registered as
+# Windows Scheduled Tasks so backend/frontend survive independently of any
+# one terminal session -- see scripts/start_backend.bat / start_frontend.bat)
+scripts/

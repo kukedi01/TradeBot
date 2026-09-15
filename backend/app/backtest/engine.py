@@ -1,5 +1,6 @@
 from collections import deque
 
+from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT
 from app.execution.fill_simulator import simulate_fill
 from app.risk.correlation import compute_correlation_matrix_from_returns, correlation_size_multiplier, returns_from_closes
 from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
@@ -9,6 +10,26 @@ from app.strategies.registry import STRATEGY_BUILDERS
 from app.strategies.regime import pick_strategy
 
 REGIME_HISTORY_LENGTH = 30
+
+
+def _resolve_size_override(size_fraction_override: float | dict[str, float] | None, strategy_name: str) -> float | None:
+    """A backtest can be run either with each strategy's own hand-picked
+    default size (pass None -- the historical behavior) or with the
+    Kelly-derived sizes a live session actually hands its strategies (pass a
+    float, or a per-strategy dict, from risk/position_sizing.py's
+    live_size_overrides()). The difference is not cosmetic: live grid runs at
+    the 0.8 Kelly cap while its own default is 0.1, an 8x gap that made every
+    "auto" backtest look far less invested -- and therefore far less
+    profitable in a rising market -- than the bot really is. Computing the
+    Kelly value here instead of taking it as a parameter isn't possible:
+    risk/position_sizing.py imports this module, so importing it back would
+    be a circular import (and would recurse, since Kelly is itself a
+    backtest)."""
+    if size_fraction_override is None:
+        return None
+    if isinstance(size_fraction_override, dict):
+        return size_fraction_override.get(strategy_name)
+    return size_fraction_override
 
 
 def _run_hold(symbol: str, candles: list[list], starting_balance_usd: float) -> dict:
@@ -28,20 +49,40 @@ def _run_hold(symbol: str, candles: list[list], starting_balance_usd: float) -> 
     }
 
 
-def _run_auto(symbol: str, candles: list[list], starting_balance_usd: float) -> dict:
+def _run_auto(
+    symbol: str,
+    candles: list[list],
+    starting_balance_usd: float,
+    size_fraction_override: float | dict[str, float] | None = None,
+) -> dict:
     """Same regime-based strategy switching as a live 'auto' session (see
     session/loop.py): every candle, recent price action decides whether Grid
     or Trend/momentum is in control, with the same hysteresis. All
     strategies stay ticking so their state carries over correctly on a
-    switch; only the active one's buys execute, but any strategy's sell
-    always goes through so a position never gets stranded."""
+    switch; only the active one's buys execute. A sell executes from the
+    position's actual owner (whichever strategy's buy created the currently
+    held quantity) or from the currently active strategy (so a regime flip
+    can still hand off the exit) -- and a handoff sell (active strategy
+    closing a position it didn't open) additionally must clear the
+    *original* owner's cost basis by HANDOFF_MIN_PROFIT_MARGIN_PCT, exactly
+    like session/loop.py's run_tick. Before this was added, this backtest
+    was silently testing a more permissive "any strategy's sell always goes
+    through" rule that live auto sessions haven't actually used since --
+    it let trend_momentum whipsaw out grid's dip-buys within hours at a
+    negligible or negative margin on every regime flip, which is most of why
+    a 29-day BTC 'auto' backtest showed only +1.4% while price itself rose
+    +22.6%: not a real strategy limitation, a stale backtest/live mismatch."""
     base_asset = symbol.split("/")[0]
     first_close = candles[0][4]
-    strategies = {name: builder(symbol, first_close) for name, builder in STRATEGY_BUILDERS.items()}
+    strategies = {
+        name: builder(symbol, first_close, size_fraction_override=_resolve_size_override(size_fraction_override, name))
+        for name, builder in STRATEGY_BUILDERS.items()
+    }
 
     cash_usd = starting_balance_usd
     held_qty = 0.0
     avg_cost = 0.0
+    position_owner: str | None = None
     price_history: deque[float] = deque(maxlen=REGIME_HISTORY_LENGTH)
     previous_regime = None
 
@@ -69,6 +110,23 @@ def _run_auto(symbol: str, candles: list[list], starting_balance_usd: float) -> 
                 if signal.side == "buy" and strategy_name != active_strategy_name:
                     strategy.on_signal_not_filled()
                     continue
+                if (
+                    signal.side == "sell"
+                    and position_owner is not None
+                    and strategy_name != position_owner
+                    and strategy_name != active_strategy_name
+                ):
+                    strategy.on_signal_not_filled()
+                    continue
+                if (
+                    signal.side == "sell"
+                    and position_owner is not None
+                    and strategy_name != position_owner
+                    and avg_cost > 0
+                    and close < avg_cost * (1 + HANDOFF_MIN_PROFIT_MARGIN_PCT / 100)
+                ):
+                    strategy.on_signal_not_filled()
+                    continue
                 size_fraction = signal.size_fraction
                 if signal.side == "buy":
                     size_fraction *= volatility_size_multiplier(list(price_history))
@@ -81,6 +139,7 @@ def _run_auto(symbol: str, candles: list[list], starting_balance_usd: float) -> 
                     cash_usd -= fill_price * qty + fee
                     avg_cost = (avg_cost * held_qty + fill_price * qty) / (held_qty + qty)
                     held_qty += qty
+                    position_owner = strategy_name
                 else:
                     realized_pnl = (fill_price - avg_cost) * qty - fee
                     if realized_pnl > 0:
@@ -89,6 +148,8 @@ def _run_auto(symbol: str, candles: list[list], starting_balance_usd: float) -> 
                         loss_pnls.append(realized_pnl)
                     cash_usd += fill_price * qty - fee
                     held_qty -= qty
+                    if held_qty <= 1e-9:
+                        position_owner = None
 
                 trade_log.append(
                     {"side": signal.side, "qty": qty, "price": fill_price, "fee": fee, "reason": signal.reason}
@@ -105,21 +166,32 @@ def _run_auto(symbol: str, candles: list[list], starting_balance_usd: float) -> 
     }
 
 
-def run_backtest(strategy_name: str, symbol: str, candles: list[list], starting_balance_usd: float = 10000.0) -> dict:
+def run_backtest(
+    strategy_name: str,
+    symbol: str,
+    candles: list[list],
+    starting_balance_usd: float = 10000.0,
+    size_fraction_override: float | dict[str, float] | None = None,
+) -> dict:
     """Replays a strategy candle-by-candle over historical OHLCV data using
     the same fill simulation as live paper trading, tracking an average cost
-    basis so we can tell a winning trade from a losing one."""
+    basis so we can tell a winning trade from a losing one.
+
+    size_fraction_override defaults to None (each strategy's own default
+    size), which is what Kelly sizing itself must use to avoid recursing --
+    see _resolve_size_override for why passing live-equivalent sizes matters
+    for every other kind of comparison."""
 
     if strategy_name == "hold":
         return _run_hold(symbol, candles, starting_balance_usd)
 
     if strategy_name == "auto":
-        return _run_auto(symbol, candles, starting_balance_usd)
+        return _run_auto(symbol, candles, starting_balance_usd, size_fraction_override)
 
     builder = STRATEGY_BUILDERS[strategy_name]
     base_asset = symbol.split("/")[0]
     first_close = candles[0][4]
-    strategy = builder(symbol, first_close)
+    strategy = builder(symbol, first_close, size_fraction_override=_resolve_size_override(size_fraction_override, strategy_name))
 
     cash_usd = starting_balance_usd
     held_qty = 0.0
@@ -218,6 +290,7 @@ def run_multi_coin_backtest(
     candles_by_symbol: dict[str, list[list]],
     starting_balance_usd: float = 10000.0,
     max_drawdown_pct: float | None = None,
+    size_fraction_override: float | dict[str, float] | None = None,
 ) -> dict:
     """Mirrors session/loop.py's run_tick as closely as a backtest can: all
     tradable coins replayed in lockstep against one shared cash pool, with
@@ -268,7 +341,9 @@ def run_multi_coin_backtest(
     def get_strategy(symbol: str, name: str, first_price: float):
         key = (symbol, name)
         if key not in strategies:
-            strategies[key] = STRATEGY_BUILDERS[name](symbol, first_price)
+            strategies[key] = STRATEGY_BUILDERS[name](
+                symbol, first_price, size_fraction_override=_resolve_size_override(size_fraction_override, name)
+            )
         return strategies[key]
 
     for step in range(step_count):
