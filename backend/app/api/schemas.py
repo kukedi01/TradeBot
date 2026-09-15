@@ -18,6 +18,11 @@ class TargetUpdate(BaseModel):
 class PortfolioOut(BaseModel):
     cash_usd: float
     holdings: dict
+    # Weighted-average entry price per held asset. Already stored on the
+    # Portfolio row for the stop-loss guardrail -- exposing it here is what
+    # lets the dashboard show a position's unrealized profit/loss, not just
+    # its current value.
+    cost_basis: dict = {}
 
     class Config:
         from_attributes = True

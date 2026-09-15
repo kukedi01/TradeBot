@@ -11,6 +11,10 @@ export function parseTimestamp(ts: string): Date {
 export interface Portfolio {
   cash_usd: number;
   holdings: Record<string, number>;
+  // Weighted-average entry price per held asset -- what a position actually
+  // cost, so the dashboard can show unrealized profit/loss next to its
+  // current value.
+  cost_basis: Record<string, number>;
 }
 
 export interface TradingSession {
@@ -171,8 +175,10 @@ export interface Snapshot {
   hodl_value_eur: number;
 }
 
-export async function getSnapshots(sessionId: number): Promise<Snapshot[]> {
-  const res = await fetch(`${API_BASE}/session/${sessionId}/snapshots`);
+export type SnapshotPeriod = "1h" | "1d" | "1w" | "1m" | "6m" | "1y";
+
+export async function getSnapshots(sessionId: number, period: SnapshotPeriod = "1d"): Promise<Snapshot[]> {
+  const res = await fetch(`${API_BASE}/session/${sessionId}/snapshots?period=${period}`);
   return res.json();
 }
 
@@ -226,5 +232,77 @@ export interface DailyRange {
 
 export async function getDailyRange(symbol: string): Promise<DailyRange> {
   const res = await fetch(`${API_BASE}/market/daily-range/${symbol}`);
+  return res.json();
+}
+
+export interface MarketOverview {
+  symbol: string;
+  price: number | null;
+  change_pct_24h: number | null;
+  daily_high: number | null;
+  daily_low: number | null;
+}
+
+export async function getMarketOverview(): Promise<MarketOverview[]> {
+  const res = await fetch(`${API_BASE}/market/overview`);
+  return res.json();
+}
+
+// The two prices a coin's grid is waiting for. Null thresholds mean there
+// isn't one to name: trend_momentum enters on a moving-average cross rather
+// than at a fixed price, and a freshly recentered grid has no "next step
+// down" yet. See backend loop.get_strategy_plan.
+export interface StrategyPlan {
+  symbol: string;
+  active_strategy: string | null;
+  rule: string | null;
+  next_buy_below: number | null;
+  next_sell_above: number | null;
+  band_low?: number;
+  band_high?: number;
+  level_count?: number;
+  owned_levels?: number;
+  current_level?: number | null;
+}
+
+export async function getPlan(sessionId: number): Promise<StrategyPlan[]> {
+  const res = await fetch(`${API_BASE}/session/${sessionId}/plan`);
+  const data = await res.json();
+  return data.per_symbol;
+}
+
+export interface StrategyPerformance {
+  strategy: string;
+  buys: number;
+  sells: number;
+  realized_pnl: number;
+  fees: number;
+  wins: number;
+  losses: number;
+  win_rate_pct: number | null;
+}
+
+// Which strategy actually made or lost money -- attributed to whichever one
+// *closed* each position, which is what makes a regime handoff visible.
+export async function getStrategyPerformance(sessionId: number): Promise<StrategyPerformance[]> {
+  const res = await fetch(`${API_BASE}/session/${sessionId}/strategy-performance`);
+  return res.json();
+}
+
+export interface MarketFlowSnapshot {
+  timestamp: string;
+  symbol: string;
+  price: number;
+  volume_delta: number;
+  cumulative_volume_delta: number;
+  trade_count: number;
+  open_interest: number | null;
+}
+
+// Order-flow history. Nothing in the trading path reads this yet -- it's
+// being accumulated so the signals can eventually be tested against real
+// history (see backend market_data/flow.py).
+export async function getMarketFlow(limit = 400): Promise<MarketFlowSnapshot[]> {
+  const res = await fetch(`${API_BASE}/market/flow?limit=${limit}`);
   return res.json();
 }

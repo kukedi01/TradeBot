@@ -1,4 +1,7 @@
+from datetime import datetime, timedelta
+
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import text
 from sqlalchemy.orm import Session as DbSession
 
 from app.api.schemas import (
@@ -15,7 +18,7 @@ from app.db.database import SessionLocal
 from app.db.models import Portfolio, PortfolioSnapshot, Trade, TradingSession
 from app.execution.paper_executor import PaperExecutor
 from app.session import manager
-from app.session.loop import get_chart_data, get_decision_log, get_regime_state, run_tick
+from app.session.loop import get_chart_data, get_decision_log, get_regime_state, get_strategy_plan, run_tick
 
 router = APIRouter(prefix="/session", tags=["session"])
 
@@ -164,15 +167,85 @@ def list_trades(session_id: int, db: DbSession = Depends(get_db)):
     return result
 
 
+# How much recent history the equity chart gets at full (~30s tick)
+# resolution, regardless of which period is requested -- today's exact
+# wiggle is always worth showing in full, even on a "1 year" view. Anything
+# older than this is thinned, which is what keeps the payload small no
+# matter how long the session has been running (22 215 points / 2.5 MB after
+# 8 days running, before this existed).
+SNAPSHOT_RECENT_HOURS = 6
+
+# period key -> (how far back it reaches, bucket width for the thinned part).
+# The bucket width is chosen so every period returns roughly the same number
+# of points (a few hundred) regardless of span -- a wider period means a
+# coarser bucket, not a bigger response.
+SNAPSHOT_PERIODS: dict[str, tuple[int, int]] = {
+    "1h": (1, 60),  # 1 hour back, bucket doesn't matter -- entirely within the full-res window
+    "1d": (24, 5 * 60),
+    "1w": (7 * 24, 60 * 60),
+    "1m": (30 * 24, 6 * 60 * 60),
+    "6m": (182 * 24, 24 * 60 * 60),
+    "1y": (365 * 24, 2 * 24 * 60 * 60),
+}
+DEFAULT_SNAPSHOT_PERIOD = "1d"
+
+
 @router.get("/{session_id}/snapshots", response_model=list[SnapshotOut])
-def list_snapshots(session_id: int, db: DbSession = Depends(get_db)):
-    snapshots = (
+def list_snapshots(session_id: int, period: str = DEFAULT_SNAPSHOT_PERIOD, db: DbSession = Depends(get_db)):
+    span_hours, bucket_seconds = SNAPSHOT_PERIODS.get(period, SNAPSHOT_PERIODS[DEFAULT_SNAPSHOT_PERIOD])
+    now = datetime.utcnow()
+    period_start = now - timedelta(hours=span_hours)
+    # The full-res window never exceeds the requested period itself -- an
+    # "1 hour" request stays entirely full-resolution rather than being
+    # thinned against a 6h window wider than what was asked for.
+    recent_start = now - timedelta(hours=min(SNAPSHOT_RECENT_HOURS, span_hours))
+
+    older: list[PortfolioSnapshot] = []
+    if period_start < recent_start:
+        # Older-than-recent rows are thinned to one point per bucket (the
+        # last snapshot actually recorded in that bucket, not an average --
+        # a real value, just sampled less often). Bucketing by
+        # floor(unix_seconds / bucket_seconds) works for any bucket width,
+        # unlike strftime's fixed hour/day/week units, so one query serves
+        # every period. MAX(id) breaks ties since ids are inserted in
+        # timestamp order, and selecting by id avoids a second round-trip.
+        thinned_ids = [
+            row[0]
+            for row in db.execute(
+                text(
+                    """
+                    SELECT MAX(id)
+                    FROM portfolio_snapshots
+                    WHERE session_id = :session_id AND timestamp >= :period_start AND timestamp < :recent_start
+                    GROUP BY CAST(strftime('%s', timestamp) AS INTEGER) / :bucket_seconds
+                    """
+                ),
+                {
+                    "session_id": session_id,
+                    "period_start": period_start,
+                    "recent_start": recent_start,
+                    "bucket_seconds": bucket_seconds,
+                },
+            ).all()
+        ]
+        if thinned_ids:
+            older = (
+                db.query(PortfolioSnapshot)
+                .filter(PortfolioSnapshot.id.in_(thinned_ids))
+                .order_by(PortfolioSnapshot.timestamp)
+                .all()
+            )
+
+    recent = (
         db.query(PortfolioSnapshot)
-        .filter(PortfolioSnapshot.session_id == session_id)
+        .filter(
+            PortfolioSnapshot.session_id == session_id,
+            PortfolioSnapshot.timestamp >= max(recent_start, period_start),
+        )
         .order_by(PortfolioSnapshot.timestamp)
         .all()
     )
-    return snapshots
+    return older + recent
 
 
 @router.get("/{session_id}/regime")
@@ -193,6 +266,16 @@ def get_decisions(session_id: int, db: DbSession = Depends(get_db)):
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"decisions": get_decision_log(db, session_id)}
+
+
+@router.get("/{session_id}/plan")
+def get_plan(session_id: int, db: DbSession = Depends(get_db)):
+    """What each coin is waiting for, as concrete prices -- the "why isn't it
+    buying, the price looks low?" view. See loop.get_strategy_plan."""
+    session = manager.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+    return {"per_symbol": get_strategy_plan(db, session_id)}
 
 
 @router.get("/{session_id}/strategy-performance")

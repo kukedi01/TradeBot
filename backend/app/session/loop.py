@@ -3,6 +3,7 @@ import time
 from collections import deque
 from datetime import datetime
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session as DbSession
 
 from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT, REGIME_SELF_GATING_STRATEGIES, TRADABLE_SYMBOLS
@@ -200,6 +201,102 @@ def get_regime_state(session_id: int) -> list[dict]:
         {"symbol": symbol, **_regime_state.get((session_id, symbol), {"regime": None, "active_strategy": None})}
         for symbol in TRADABLE_SYMBOLS
     ]
+
+
+def get_strategy_plan(db: DbSession, session_id: int) -> list[dict]:
+    """The two prices each coin's grid is actually waiting for.
+
+    The decision log explains what the bot *did*; this answers the question
+    that kept coming up instead -- "the price is near the bottom, why isn't
+    it buying?". Grid never buys because a price is low in absolute terms: it
+    buys when price steps *down* into a level it doesn't already hold, and
+    sells only once price clears the whole position's blended cost basis by
+    min_profit_margin_pct. Both are exact numbers, so showing them beats
+    leaving them to be inferred.
+
+    Only grid gets thresholds. trend_momentum enters on a confirmed moving
+    average cross plus a 4h agreement check, which doesn't reduce to a single
+    price -- it reports that rather than inventing one.
+    """
+    portfolio = db.get(Portfolio, session_id)
+    cost_basis = (portfolio.cost_basis or {}) if portfolio else {}
+
+    plans: list[dict] = []
+    for symbol in TRADABLE_SYMBOLS:
+        active = _regime_state.get((session_id, symbol), {}).get("active_strategy")
+        entry: dict = {
+            "symbol": symbol,
+            "active_strategy": active,
+            "rule": active,
+            "next_buy_below": None,
+            "next_sell_above": None,
+        }
+
+        grid = _strategy_instances.get((session_id, symbol, "grid"))
+        if active != "grid" or grid is None:
+            plans.append(entry)
+            continue
+
+        band_low, step = grid.lower_bound, grid.step
+        entry.update(
+            {
+                # Rounded generously, not to 2 decimals: XRP trades near 1
+                # EUR, where 2 decimals both loses the meaningful digits and
+                # can round a threshold the *wrong way* (1.227 -> 1.23 reads
+                # as a higher buy price than the one that actually fires).
+                # The frontend formats per coin -- see priceDigits().
+                "band_low": round(band_low, 6),
+                "band_high": round(grid.upper_bound, 6),
+                "level_count": grid.grid_levels,
+                "owned_levels": len(grid.owned_levels),
+                "current_level": grid.last_level,
+            }
+        )
+
+        # last_level is None right after a recenter, or while price sits
+        # outside the band -- there's no "next step down" to name yet.
+        if grid.last_level is None:
+            plans.append(entry)
+            continue
+
+        # A buy fires on stepping down into the nearest level below the one
+        # grid is tracking that it doesn't already hold, so the trigger is
+        # that level's upper edge. Note this can be well below the level
+        # immediately underneath: while grid holds a level underwater it
+        # keeps last_level pinned there, so every level above stays out of
+        # reach for buying until the position resolves.
+        target = next((lvl for lvl in range(grid.last_level - 1, -1, -1) if lvl not in grid.owned_levels), None)
+        if target is not None:
+            threshold = band_low + (target + 1) * step
+            # The move also has to clear the hysteresis bar that stops tick
+            # noise near a boundary from counting as a dip.
+            if grid.last_trade_price is not None:
+                threshold = min(threshold, grid.last_trade_price * (1 - grid.min_move_pct / 100))
+            entry["next_buy_below"] = round(threshold, 6)
+
+        if grid.last_level in grid.owned_levels:
+            # Price has to both leave the held level upward *and* clear the
+            # position's blended cost by the profit margin -- whichever is
+            # higher is the one that actually binds.
+            threshold = band_low + (grid.last_level + 1) * step
+            cost = cost_basis.get(symbol.split("/")[0], 0.0)
+            if cost > 0:
+                threshold = max(threshold, cost * (1 + grid.min_profit_margin_pct / 100))
+            entry["next_sell_above"] = round(threshold, 6)
+
+        plans.append(entry)
+
+    return plans
+
+
+def _portfolio_value(portfolio: Portfolio, prices: dict[str, float]) -> float:
+    """Cash plus every coin's holdings at current prices. Recomputed per
+    signal rather than once per tick, since an earlier trade this same tick
+    already changed both sides of it."""
+    holdings = portfolio.holdings or {}
+    return portfolio.cash_usd + sum(
+        holdings.get(symbol.split("/")[0], 0) * price for symbol, price in prices.items()
+    )
 
 
 def _volume_delta(session_id: int, symbol: str, raw_volume_24h: float) -> float:
@@ -516,6 +613,8 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
             size_multiplier=sentiment.size_multiplier,
             volume=volumes[symbol],
             cost_basis=position_cost_basis,
+            portfolio_value=_portfolio_value(portfolio, prices),
+            position_owner=_position_owners.get((session_id, symbol)),
         )
         closed_candle = _update_candle(session_id, symbol, price, volumes[symbol], datetime.utcnow())
         _load_4h_trend_if_needed(db, session_id, symbol)
@@ -540,6 +639,8 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     size_multiplier=sentiment.size_multiplier,
                     cost_basis=position_cost_basis,
                     volume=closed_candle["volume"],
+                    portfolio_value=_portfolio_value(portfolio, prices),
+                    position_owner=_position_owners.get((session_id, symbol)),
                 )
             else:
                 strategy_ctx = ctx
@@ -673,8 +774,48 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     _set_position_owner(db, session_id, signal.symbol, strategy_name)
                 else:
                     remaining = (portfolio.holdings or {}).get(base_asset, 0)
-                    if remaining <= 1e-9:
+                    closed_out = remaining <= 1e-9
+                    if closed_out:
                         _clear_position_owner(db, session_id, signal.symbol)
+
+                    # Tell the strategies whose position just moved underneath
+                    # them -- the same notification the stop-loss path above
+                    # has always done, which the ordinary sell path never did.
+                    #
+                    # Seen live on XRP: trend_momentum closed grid's entire
+                    # position on a regime flip, grid kept levels 2/3/4 marked
+                    # as owned, and its next buy threshold then skipped the
+                    # 1.19-1.23 EUR range it was actually flat in -- silently
+                    # refusing dips it should have bought. Clearing is the safe
+                    # direction to be wrong: grid becomes willing to re-buy a
+                    # level, and its cost-basis exit rule still stops it
+                    # selling at a loss.
+                    #
+                    # Fully closed: nobody holds anything here any more, so no
+                    # level can still be owned and every strategy is told,
+                    # the seller included. Handoff sell (a strategy that
+                    # didn't open the position selling part of it): the real
+                    # owner's per-level bookkeeping is now unreliable, but the
+                    # seller's own state is about its own logic and stays.
+                    if closed_out:
+                        notify = list(candidate_names)
+                    elif owner is not None and strategy_name != owner:
+                        notify = [name for name in candidate_names if name != strategy_name]
+                    else:
+                        notify = []
+
+                    for other_name in notify:
+                        other = _strategy_instances.get((session_id, symbol, other_name))
+                        if other is None:
+                            continue
+                        other.on_external_sell()
+                        # Saved right here rather than left to the
+                        # end-of-strategy save below: a strategy earlier in
+                        # candidate_names has already been saved this tick, so
+                        # its cleared state would otherwise not reach the DB
+                        # until the next tick -- and not at all if the backend
+                        # restarts in between.
+                        save_state(db, session_id, symbol, other_name, other.get_state())
 
             # Saved after signal processing (not right after on_tick) so a
             # speculative owned_levels/in_position mutation that
@@ -699,13 +840,20 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                 f"Session #{session_id}: {total_value:.2f} EUR (cél: {session.target_balance:.2f} EUR)",
             )
         else:
-            past_values = [
-                row[0]
-                for row in db.query(PortfolioSnapshot.total_value_eur)
+            # Only the peak matters to the drawdown check, so let SQLite
+            # compute it instead of loading the whole history every tick:
+            # after 8 days that was 22 349 rows / ~29ms per tick, growing
+            # without bound, to produce one number a MAX() returns in ~2ms.
+            # (Same mistake the snapshots endpoint had.) The snapshot added
+            # just above is included via autoflush, exactly as before.
+            peak_value = (
+                db.query(func.max(PortfolioSnapshot.total_value_eur))
                 .filter(PortfolioSnapshot.session_id == session_id)
-                .all()
-            ]
-            risk_check = check_drawdown_limit(total_value, past_values, session.max_drawdown_pct)
+                .scalar()
+            )
+            risk_check = check_drawdown_limit(
+                total_value, [peak_value] if peak_value is not None else [], session.max_drawdown_pct
+            )
             if risk_check.breached:
                 session.status = "risk_stopped"
                 send_desktop_notification(

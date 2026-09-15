@@ -12,23 +12,79 @@ def gentle_uptrend(n=35, seed=7, drift=0.15, noise=0.3):
     return prices
 
 
-def run(strategy, prices, volumes=None, holdings_by_tick=None):
+def run(strategy, prices, volumes=None, holdings_by_tick=None, owner=None):
     signals = []
     for i, price in enumerate(prices):
         holdings = holdings_by_tick[i] if holdings_by_tick else {}
         volume = volumes[i] if volumes else 10.0
-        ctx = StrategyContext(symbol="TEST/EUR", price=price, cash_usd=1000.0, holdings=holdings, volume=volume)
+        ctx = StrategyContext(
+            symbol="TEST/EUR",
+            price=price,
+            cash_usd=1000.0,
+            holdings=holdings,
+            volume=volume,
+            position_owner=owner,
+        )
         signals.extend(strategy.on_tick(ctx))
     return signals
 
 
-class TestPositionDerivedFromHoldings:
-    def test_no_buy_signal_ever_fires_while_already_holding(self):
+class TestWhosePositionIsIt:
+    """The holdings dict is shared across every strategy on a symbol, so
+    "something is held" and "*I* am invested" are different questions. Reading
+    the first as the second is what silently disabled this strategy's entries
+    for an entire 8-day live session: grid held the coins 95.7-100% of the
+    time, and trend_momentum produced 0 buy signals against 12 sells. A
+    backtest across 30/90/180-day windows put the cost at +2.4 to +9.4
+    percentage points of return.
+    """
+
+    def test_buys_when_another_strategy_owns_the_position(self):
+        """The regression that matters: grid holding the coin must not make
+        this strategy think it is already invested."""
         strategy = TrendMomentumStrategy(symbol="TEST/EUR", min_cross_gap_pct=0.0, volume_confirmation_multiplier=0.0)
         prices = gentle_uptrend()
         holdings = [{"TEST": 1.0}] * len(prices)
-        signals = run(strategy, prices, holdings_by_tick=holdings)
+
+        signals = run(strategy, prices, holdings_by_tick=holdings, owner="grid")
+
+        assert any(s.side == "buy" for s in signals)
+
+    def test_does_not_buy_into_its_own_existing_position(self):
+        strategy = TrendMomentumStrategy(symbol="TEST/EUR", min_cross_gap_pct=0.0, volume_confirmation_multiplier=0.0)
+        prices = gentle_uptrend()
+        holdings = [{"TEST": 1.0}] * len(prices)
+
+        signals = run(strategy, prices, holdings_by_tick=holdings, owner="trend_momentum")
+
         assert all(s.side != "buy" for s in signals)
+
+    def test_does_not_buy_while_ownership_is_unknown(self):
+        """None means the record was lost (a position predating ownership
+        tracking, say). Not stacking onto a position whose origin is unknown
+        is the recoverable way to be wrong."""
+        strategy = TrendMomentumStrategy(symbol="TEST/EUR", min_cross_gap_pct=0.0, volume_confirmation_multiplier=0.0)
+        prices = gentle_uptrend()
+        holdings = [{"TEST": 1.0}] * len(prices)
+
+        signals = run(strategy, prices, holdings_by_tick=holdings, owner=None)
+
+        assert all(s.side != "buy" for s in signals)
+
+    def test_still_exits_a_position_it_does_not_own(self):
+        """The regime-flip handoff exit has to keep working -- the exit asks
+        "is there something to sell", not "is it mine". The loop decides
+        separately whether that sell is allowed and at what margin."""
+        strategy = TrendMomentumStrategy(symbol="TEST/EUR")
+        falling = [150.0 - i * 0.5 for i in range(25)]
+        holdings = [{"TEST": 1.0}] * len(falling)
+
+        signals = run(strategy, falling, holdings_by_tick=holdings, owner="grid")
+
+        assert any(s.side == "sell" for s in signals)
+
+
+class TestPositionDerivedFromHoldings:
 
     def test_no_phantom_sell_retry_when_holdings_are_actually_zero(self):
         # A falling price satisfies the death-cross/band-break exit

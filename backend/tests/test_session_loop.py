@@ -168,6 +168,65 @@ class TestSellOwnership:
 
         assert _position_owners[(session_id, SYMBOL)] == "grid"
 
+    def test_a_handoff_sell_tells_the_owner_its_position_is_gone(self, db, make_session, loop_env):
+        """The bug this covers ran live on XRP: a handoff sell closed grid's
+        whole position on a regime flip, nothing told grid, and grid went on
+        listing levels 2/3/4 as owned -- so its next buy threshold skipped a
+        1.19-1.23 EUR range it was actually flat in, silently refusing dips it
+        should have bought. Only the stop-loss path sent this notification;
+        the ordinary sell path never did.
+        """
+        session_id = make_session(holdings={"BTC": 0.01}, cost_basis={"BTC": 50000.0}, cash=100.0)
+        loop_env.set_regime("grid", "ranging")
+        loop_env.set_owner(session_id, SYMBOL, "trend_momentum")
+        owner = ScriptedStrategy("trend_momentum")
+        loop_env.install(
+            session_id,
+            SYMBOL,
+            {"grid": ScriptedStrategy("grid", [sell()]), "trend_momentum": owner},
+        )
+
+        run_tick(db, session_id)
+
+        assert len(trades_for(db, session_id)) == 1
+        assert owner.external_sell_count == 1
+
+    def test_a_partial_handoff_notifies_the_owner_but_not_the_seller(self, db, make_session, loop_env):
+        """Clearing the seller's own position tracking would make it forget a
+        position it still legitimately holds part of -- the notification is
+        for the strategy the sell happened *to*, not the one making it."""
+        session_id = make_session(holdings={"BTC": 0.01}, cost_basis={"BTC": 50000.0}, cash=100.0)
+        loop_env.set_regime("grid", "ranging")
+        loop_env.set_owner(session_id, SYMBOL, "trend_momentum")
+        seller = ScriptedStrategy("grid", [sell(size=0.5)])
+        owner = ScriptedStrategy("trend_momentum")
+        loop_env.install(session_id, SYMBOL, {"grid": seller, "trend_momentum": owner})
+
+        run_tick(db, session_id)
+
+        assert owner.external_sell_count == 1
+        assert seller.external_sell_count == 0
+
+    def test_closing_the_position_out_notifies_every_strategy_including_the_seller(
+        self, db, make_session, loop_env
+    ):
+        """Once holdings hit zero no strategy can still be holding a level,
+        so the one that made the sell is told too -- grid's own sell frees a
+        fraction of the holding rather than one specific level, so it can
+        otherwise be left listing levels against an empty position."""
+        session_id = make_session(holdings={"BTC": 0.01}, cost_basis={"BTC": 50000.0}, cash=100.0)
+        loop_env.set_regime("grid", "ranging")
+        loop_env.set_owner(session_id, SYMBOL, "grid")
+        seller = ScriptedStrategy("grid", [sell(size=1.0)])
+        other = ScriptedStrategy("dca_rebalance")
+        loop_env.install(session_id, SYMBOL, {"grid": seller, "dca_rebalance": other})
+
+        run_tick(db, session_id)
+
+        assert len(trades_for(db, session_id)) == 1
+        assert seller.external_sell_count == 1
+        assert other.external_sell_count == 1
+
 
 class TestSentiment:
     def test_a_sentiment_pause_blocks_buys(self, db, make_session, loop_env):

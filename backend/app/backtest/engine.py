@@ -103,6 +103,10 @@ def _run_auto(
             holdings={base_asset: held_qty},
             volume=candle[5],
             cost_basis=avg_cost if held_qty > 0 else 0.0,
+            # Single-symbol backtest: this one coin plus cash *is* the
+            # whole portfolio.
+            portfolio_value=cash_usd + held_qty * close,
+            position_owner=position_owner,
         )
 
         # Position-level stop-loss, checked before any strategy ticks --
@@ -138,6 +142,8 @@ def _run_auto(
                         holdings={base_asset: held_qty},
                         volume=candle[5],
                         cost_basis=avg_cost if held_qty > 0 else 0.0,
+                        portfolio_value=cash_usd + held_qty * close,
+                        position_owner=position_owner,
                     )
 
         for strategy_name, strategy in strategies.items():
@@ -252,6 +258,11 @@ def run_backtest(
             holdings={base_asset: held_qty},
             volume=candle[5],
             cost_basis=avg_cost if held_qty > 0 else 0.0,
+            # Single-symbol backtest: this one coin plus cash *is* the
+            # whole portfolio, and with only one strategy running, anything
+            # held can only be that strategy's own position.
+            portfolio_value=cash_usd + held_qty * close,
+            position_owner=strategy.name if held_qty > 0 else None,
         )
         signals = strategy.on_tick(ctx)
 
@@ -445,6 +456,9 @@ def run_multi_coin_backtest(
                     holdings=dict(holdings),
                     volume=volumes[symbol],
                     cost_basis=cost_basis.get(base_asset, 0.0),
+                    portfolio_value=cash_usd
+                    + sum(holdings.get(s.split("/")[0], 0) * p for s, p in prices.items()),
+                    position_owner=position_owners.get(base_asset),
                 )
 
                 for name in candidate_names:

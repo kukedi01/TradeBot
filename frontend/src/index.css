@@ -1,64 +1,52 @@
-@import url("https://fonts.googleapis.com/css2?family=Orbitron:wght@600;700;800&family=Rajdhani:wght@500;600;700&family=Space+Mono:wght@400;700&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,500;12..96,600;12..96,700&family=Work+Sans:ital,wght@0,400;0,500;0,600;1,400&family=JetBrains+Mono:wght@400;500;600&display=swap");
 
 :root {
-  color-scheme: dark;
+  color-scheme: light;
 
-  --bg: #05070d;
-  --bg-grid: #0a0e18;
-  --panel-bg: rgba(16, 20, 32, 0.72);
-  --panel-bg-solid: #10141f;
-  --border: #232a40;
-  --border-bright: rgba(139, 92, 246, 0.45);
+  /* Warm paper ground, white cards. Deliberately not a dark theme: the old
+     neon/sci-fi palette made every number look equally urgent, which is the
+     opposite of what a "is this beating HODL?" dashboard needs. */
+  --bg: #faf6ee;
+  --card: #ffffff;
+  --rule: #e8e1d4;
+  --hairline: #f1ece1;
 
-  --text: #98a2c0;
-  --text-h: #eef1ff;
-  --text-muted: #5c6383;
+  --ink: #26231e;
+  --ink-soft: #6f6a5f;
+  --ink-faint: #a9a294;
 
-  --accent: #8b5cf6;
-  --accent-2: #22d3ee;
-  --accent-bg: rgba(139, 92, 246, 0.14);
-  --accent-border: rgba(139, 92, 246, 0.5);
+  /* Two accents sharing roughly the same lightness/chroma, differing in hue:
+     sage carries the bot's own line and its strategies, clay marks anything
+     that needs a second glance. */
+  --sage: #4f6b5a;
+  --sage-soft: #eaf0ec;
+  --clay: #b5603b;
+  --clay-soft: #f7ece6;
 
-  --series-bot: #22d3ee;
-  --series-bot-glow: #67e8f9;
-  --series-hodl: #f472b6;
-  --series-hodl-glow: #f9a8d4;
+  --up: #3f7d5a;
+  --down: #a8412f;
+  --down-soft: #fbeee9;
+  --down-border: #e8c3b4;
+  --warn: #d9b25e;
 
-  --good: #34d399;
-  --warning: #fbbf24;
-  --critical: #f43f5e;
+  --neutral-line: #c9c1b1;
 
-  --good-bg: rgba(52, 211, 153, 0.12);
-  --warning-bg: rgba(251, 191, 36, 0.12);
-  --critical-bg: rgba(244, 63, 94, 0.14);
+  --sans: "Work Sans", "Segoe UI", system-ui, sans-serif;
+  --display: "Bricolage Grotesque", "Work Sans", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, Consolas, monospace;
 
-  --sans: "Rajdhani", system-ui, "Segoe UI", sans-serif;
-  --display: "Orbitron", var(--sans);
-  --mono: "Space Mono", ui-monospace, Consolas, monospace;
-
-  font: 17px/150% var(--sans);
-  letter-spacing: 0.2px;
-  color: var(--text);
+  font: 15px/1.55 var(--sans);
+  color: var(--ink);
   background: var(--bg);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-
-  @media (max-width: 1024px) {
-    font-size: 15px;
-  }
 }
 
 #root {
   min-height: 100svh;
-  box-sizing: border-box;
-  background:
-    radial-gradient(circle at 15% 0%, rgba(139, 92, 246, 0.16), transparent 42%),
-    radial-gradient(circle at 85% 10%, rgba(34, 211, 238, 0.12), transparent 45%),
-    linear-gradient(var(--bg-grid) 1px, transparent 1px) 0 0 / 100% 42px,
-    linear-gradient(90deg, var(--bg-grid) 1px, transparent 1px) 0 0 / 42px 100%,
-    var(--bg);
+  background: var(--bg);
 }
 
 body {
@@ -70,49 +58,42 @@ body {
 }
 
 h1,
-h2 {
+h2,
+h3 {
   font-family: var(--display);
-  color: var(--text-h);
-  text-transform: uppercase;
+  color: var(--ink);
+  font-weight: 600;
+  letter-spacing: -0.3px;
+  margin: 0;
 }
 
 h1 {
-  font-size: 30px;
+  font-size: 22px;
   font-weight: 700;
-  letter-spacing: 1.5px;
-  margin: 0;
-  background: linear-gradient(90deg, var(--text-h) 0%, var(--accent-2) 60%, var(--accent) 100%);
-  -webkit-background-clip: text;
-  background-clip: text;
-  color: transparent;
-  filter: drop-shadow(0 0 18px rgba(139, 92, 246, 0.35));
-  @media (max-width: 1024px) {
-    font-size: 22px;
-  }
+  letter-spacing: -0.4px;
+  line-height: 1.2;
 }
 
 h2 {
-  font-size: 17px;
-  font-weight: 600;
-  letter-spacing: 1.2px;
-  margin: 0 0 14px;
-  display: flex;
-  align-items: center;
-  gap: 10px;
+  font-size: 20px;
 }
 
-h2::before {
-  content: "";
-  width: 8px;
-  height: 8px;
-  background: var(--accent-2);
-  box-shadow: 0 0 8px var(--accent-2);
-  transform: rotate(45deg);
-  flex-shrink: 0;
+h3 {
+  font-size: 18px;
 }
 
 p {
   margin: 0;
+}
+
+a {
+  color: var(--clay);
+  text-decoration: none;
+}
+
+a:hover {
+  color: #8c4629;
+  text-decoration: underline;
 }
 
 code {

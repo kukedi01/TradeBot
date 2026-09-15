@@ -28,18 +28,33 @@ class DcaRebalanceStrategy(Strategy):
         base_asset = self.symbol.split("/")[0]
         held_qty = ctx.holdings.get(base_asset, 0)
         held_value = held_qty * ctx.price
-        total_value = held_value + ctx.cash_usd
-        current_allocation = held_value / total_value if total_value > 0 else 0
 
-        if current_allocation - self.target_allocation_pct > self.drift_threshold_pct:
+        # Measured against the *whole* portfolio (ctx.portfolio_value), not
+        # against this coin plus the shared cash pool. The old
+        # `held_value + ctx.cash_usd` treated cash as the only other asset,
+        # which in a four-coin session inflated a real 12.5% ETH weight into
+        # a reported 81.8% -- so this fired a rebalance sell on three coins
+        # out of four, 424 times against 113 scheduled buys. Every one of
+        # them was blocked downstream, so no money moved, but they were real
+        # signals built on a number that meant nothing.
+        #
+        # 0.0 means the caller didn't supply a portfolio value, so the share
+        # is genuinely unknown -- skip the rebalance rather than act on a
+        # figure we'd have to invent.
+        if ctx.portfolio_value > 0:
+            current_allocation = held_value / ctx.portfolio_value
+        else:
+            current_allocation = None
+
+        if current_allocation is not None and current_allocation - self.target_allocation_pct > self.drift_threshold_pct:
             return [
                 TradeSignal(
                     symbol=self.symbol,
                     side="sell",
                     size_fraction=0.2,
                     reason=(
-                        f"dca_rebalance: allocation {current_allocation:.0%} above "
-                        f"target {self.target_allocation_pct:.0%}, rebalancing down"
+                        f"dca_rebalance: allocation {current_allocation:.0%} of the portfolio, "
+                        f"above target {self.target_allocation_pct:.0%}, rebalancing down"
                     ),
                 )
             ]

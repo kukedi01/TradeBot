@@ -8,9 +8,10 @@ from app.api.routes_news import router as news_router
 from app.api.routes_risk import router as risk_router
 from app.api.routes_session import router as session_router
 from app.api.routes_strategies import router as strategies_router
+from app.constants import TRADABLE_SYMBOLS
 from app.db.database import SessionLocal, init_db
 from app.db.models import MarketFlowSnapshot
-from app.market_data.kraken_client import get_daily_high_low, get_ticker_price
+from app.market_data.kraken_client import get_daily_high_low, get_market_overview, get_ticker_price
 from app.scheduler import start_scheduler
 
 
@@ -45,6 +46,30 @@ def market_ticker(symbol: str):
 def market_daily_range(symbol: str):
     high, low = get_daily_high_low(symbol)
     return {"symbol": symbol, "high": high, "low": low}
+
+
+@app.get("/market/overview")
+def market_overview():
+    """Price, today's high/low and the 24h change for every tradable coin in
+    one call -- the dashboard shows all four side by side, so four separate
+    round-trips per refresh would be wasteful. One coin failing (rate limit,
+    timeout) returns empty fields for that coin instead of failing the whole
+    response, so three working coins still render."""
+    result = []
+    for symbol in TRADABLE_SYMBOLS:
+        try:
+            result.append(get_market_overview(symbol))
+        except Exception:
+            result.append(
+                {
+                    "symbol": symbol,
+                    "price": None,
+                    "change_pct_24h": None,
+                    "daily_high": None,
+                    "daily_low": None,
+                }
+            )
+    return result
 
 
 @app.get("/market/flow")

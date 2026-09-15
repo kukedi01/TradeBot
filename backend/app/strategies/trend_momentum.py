@@ -74,7 +74,26 @@ class TrendMomentumStrategy(Strategy):
             return []
 
         base_asset = self.symbol.split("/")[0]
-        in_position = ctx.holdings.get(base_asset, 0) > 0
+        # Two different questions, deliberately not the same flag.
+        #
+        # "Is there something here to sell?" is about the holding itself, so
+        # it reads ctx.holdings -- that's what keeps the regime-flip handoff
+        # exit working (the loop decides separately whether such a sell is
+        # allowed, and at what margin).
+        #
+        # "Am I already invested?" is about *this* strategy's own position,
+        # which ctx.holdings cannot answer: the holdings dict is shared, so
+        # grid's dip-buys read as "I am in a position" too. That is not a
+        # hypothetical -- over one live 8-day session grid held the coins
+        # 95.7-100% of the time, and this strategy produced 0 buy signals
+        # against 12 sells. It never entered a trade in its own right; it
+        # only ever closed other strategies' positions. Ownership is tracked
+        # by the loop (and by both backtest engines) and arrives as
+        # ctx.position_owner. Unknown ownership (None) with a real holding
+        # stays conservative -- don't buy into a position whose origin was
+        # lost, rather than risk stacking onto one.
+        holds_anything = ctx.holdings.get(base_asset, 0) > 0
+        holds_own_position = holds_anything and ctx.position_owner in (None, self.name)
 
         cross_gap_pct = abs(fast - slow) / slow * 100 if slow else 0.0
         golden_cross = fast > slow and cross_gap_pct >= self.min_cross_gap_pct
@@ -100,7 +119,7 @@ class TrendMomentumStrategy(Strategy):
             and not_blow_off_top
             and macd_confirmed
             and volume_confirmed
-            and not in_position
+            and not holds_own_position
         ):
             return [
                 TradeSignal(
@@ -118,7 +137,7 @@ class TrendMomentumStrategy(Strategy):
         death_cross = fast < slow and cross_gap_pct >= self.min_cross_gap_pct
         trend_broken = ctx.price < middle_band
 
-        if (death_cross or trend_broken) and in_position:
+        if (death_cross or trend_broken) and holds_anything:
             reason = "death cross" if death_cross else f"price fell below Bollinger middle band ({middle_band:.2f})"
             return [
                 TradeSignal(

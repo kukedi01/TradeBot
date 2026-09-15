@@ -30,6 +30,25 @@ class StrategyContext:
     # Only grid currently reads this, to avoid selling a level-up bounce
     # that's still below what was actually paid for the whole position.
     cost_basis: float = 0.0
+    # Cash plus *every* coin's holdings at current prices -- the only figure
+    # a strategy can use to work out what share of the portfolio it holds.
+    # `holdings` alone can't answer that: it lists every coin's quantity but
+    # `price` is only this symbol's, so there's no way to value the rest.
+    # dca_rebalance guessed at it as `held_value + cash_usd`, which treats
+    # the shared cash pool as the only other asset and inflated a real 12.5%
+    # ETH weight into a reported 81.8% -- see that strategy. 0.0 means the
+    # caller didn't supply it, and a strategy must then treat the share as
+    # unknown rather than computing a wrong one.
+    portfolio_value: float = 0.0
+    # Which strategy's buy opened the position currently held on this symbol
+    # (session/loop.py's _position_owners, the backtest engines' own
+    # equivalents), None if nothing is held or the record was lost. Needed
+    # because `holdings` is shared: without it a strategy cannot tell its own
+    # position from another strategy's, and trend_momentum read any holding
+    # at all as "I am already invested" -- which, with grid holding the coin
+    # 95.7-100% of the time, made its entry branch unreachable for a whole
+    # 8-day session (0 buys, 12 sells).
+    position_owner: str | None = None
 
 
 class Strategy(ABC):
