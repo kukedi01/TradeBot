@@ -192,7 +192,66 @@ def get_decisions(session_id: int, db: DbSession = Depends(get_db)):
     session = manager.get_session(db, session_id)
     if session is None:
         raise HTTPException(status_code=404, detail="Session not found")
-    return {"decisions": get_decision_log(session_id)}
+    return {"decisions": get_decision_log(db, session_id)}
+
+
+@router.get("/{session_id}/strategy-performance")
+def strategy_performance(session_id: int, db: DbSession = Depends(get_db)):
+    """Which strategy actually made or lost money in this session.
+
+    Attribution comes from each trade's `reason` prefix ("grid: ...",
+    "trend_momentum: ...", "risk: stop-loss ...") rather than a dedicated
+    column, so it works on every trade already recorded instead of only on
+    ones made after this view existed.
+
+    A sell's realized P&L is credited to whichever strategy closed the
+    position, using the same weighted-average cost basis PaperExecutor keeps
+    live -- so a strategy that buys well but hands the exit to another
+    (which the regime handoff allows) shows the cost of that, not the credit.
+    """
+    session = manager.get_session(db, session_id)
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    trades = db.query(Trade).filter(Trade.session_id == session_id).order_by(Trade.timestamp).all()
+    avg_cost: dict[str, float] = {}
+    held_qty: dict[str, float] = {}
+    stats: dict[str, dict] = {}
+
+    for trade in trades:
+        strategy = (trade.reason or "unknown").split(":")[0].strip() or "unknown"
+        row = stats.setdefault(
+            strategy,
+            {"strategy": strategy, "buys": 0, "sells": 0, "realized_pnl": 0.0, "fees": 0.0, "wins": 0, "losses": 0},
+        )
+        row["fees"] += trade.fee
+
+        base_asset = trade.symbol.split("/")[0]
+        previous_qty = held_qty.get(base_asset, 0.0)
+        if trade.side == "buy":
+            previous_cost = avg_cost.get(base_asset, 0.0)
+            avg_cost[base_asset] = (previous_cost * previous_qty + trade.price * trade.qty) / (
+                previous_qty + trade.qty
+            )
+            held_qty[base_asset] = previous_qty + trade.qty
+            row["buys"] += 1
+        else:
+            realized = (trade.price - avg_cost.get(base_asset, 0.0)) * trade.qty - trade.fee
+            held_qty[base_asset] = previous_qty - trade.qty
+            row["sells"] += 1
+            row["realized_pnl"] += realized
+            if realized > 0:
+                row["wins"] += 1
+            else:
+                row["losses"] += 1
+
+    for row in stats.values():
+        closed = row["wins"] + row["losses"]
+        row["win_rate_pct"] = (row["wins"] / closed * 100) if closed else None
+        row["realized_pnl"] = round(row["realized_pnl"], 4)
+        row["fees"] = round(row["fees"], 4)
+
+    return sorted(stats.values(), key=lambda row: row["realized_pnl"], reverse=True)
 
 
 @router.get("/{session_id}/chart-data")

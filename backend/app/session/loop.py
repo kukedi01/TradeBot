@@ -5,8 +5,8 @@ from datetime import datetime
 
 from sqlalchemy.orm import Session as DbSession
 
-from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT, TRADABLE_SYMBOLS
-from app.db.models import MarketFlowSnapshot, Portfolio, PortfolioSnapshot, TradingSession
+from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT, REGIME_SELF_GATING_STRATEGIES, TRADABLE_SYMBOLS
+from app.db.models import DecisionLogEntry, MarketFlowSnapshot, Portfolio, PortfolioSnapshot, TradingSession
 from app.execution.paper_executor import PaperExecutor
 from app.market_data.flow import get_open_interest, get_volume_delta
 from app.market_data.kraken_client import get_ticker_price, get_ticker_volume
@@ -27,28 +27,22 @@ from app.strategies.regime import REGIME_STRATEGY, pick_strategy
 # it (see strategies/regime.py).
 AUTO_STRATEGY = "auto"
 
-# Strategies allowed to open positions regardless of which one the regime
-# classifier currently favours, because each already refuses its own weak
-# setups: trend_momentum needs a confirmed cross (min_cross_gap_pct), MACD
-# agreement, above-average volume and 4h trend agreement; grid needs a real
-# level crossing past min_move_pct hysteresis and will only exit above its
-# blended cost basis.
-#
-# The regime gate used to apply to grid, and measurement showed it was doing
-# active harm. Over a 29-day window the label read "trending" 27-38% of the
-# time, and in those stretches grid's buys were blocked -- 36 blocked against
-# 13 executed on SOL, 30 against 7 on XRP -- while trend_momentum, the
-# strategy the gate handed control to, executed 0-1 buys in the entire
-# period (its Kelly size is 0.08-0.24 on three of the four coins, since it
-# has no proven edge there). The result was a bot that simply sat idle for
-# roughly a third of every session: the strategy that would have traded was
-# locked out, and the one holding the keys never acted. Removing the gate
-# roughly doubled backtested "auto" returns (+2.7% -> +5.3% averaged over
-# both market types and all four coins, better in 5 of 8 cases, notably SOL
-# +2.3% -> +14.0%). The regime label still selects which strategy is
-# reported as active and still governs handoff sells; it just no longer
-# decides who is allowed to trade at all.
-REGIME_SELF_GATING_STRATEGIES = {"grid", "trend_momentum"}
+# REGIME_SELF_GATING_STRATEGIES (imported above, defined in app/constants.py
+# so the backtest engine can apply the identical rule) is what keeps the
+# regime label from deciding who may trade. It used to include grid, and
+# measurement showed that was doing active harm: over a 29-day window the
+# label read "trending" 27-38% of the time, and in those stretches grid's
+# buys were blocked -- 36 blocked against 13 executed on SOL, 30 against 7 on
+# XRP -- while trend_momentum, the strategy the gate handed control to,
+# executed 0-1 buys in the entire period (its Kelly size is 0.08-0.24 on
+# three of the four coins, since it has no proven edge there). The result was
+# a bot that simply sat idle for roughly a third of every session: the
+# strategy that would have traded was locked out, and the one holding the
+# keys never acted. Removing the gate roughly doubled backtested "auto"
+# returns (+2.7% -> +5.3% averaged over both market types and all four coins,
+# better in 5 of 8 cases, notably SOL +2.3% -> +14.0%). The regime label still
+# selects which strategy is reported as active and still governs handoff
+# sells; it just no longer decides who is allowed to trade at all.
 
 REGIME_HISTORY_LENGTH = 30
 # How many ticks the coin charts (price/volume/RSI/MACD) show -- deliberately
@@ -58,13 +52,9 @@ REGIME_HISTORY_LENGTH = 30
 # without changing any trading behavior. ~30s/tick, so 240 is ~2 hours.
 CHART_HISTORY_LENGTH = 240
 
-# How many recent decision-log entries to keep per session -- a rolling
-# diagnostic feed (see _log_decision), not durable state, so this resets on
-# a backend restart same as _strategy_instances below. Sized generously
-# (roughly a full night's worth of 30s ticks across 4 coins x up to 3
-# candidate strategies) rather than the minimum needed for a quick check,
-# so an overnight unattended run doesn't quietly roll off its early hours
-# before anyone's looked at it.
+# Default cap on how many decision-log rows a single read returns. The table
+# itself keeps everything (see DecisionLogEntry) -- this only bounds the
+# response, so the frontend can't accidentally pull a month of history.
 DECISION_LOG_LENGTH = 5000
 
 # One strategy instance per (session, symbol, strategy). In auto mode all
@@ -74,11 +64,6 @@ DECISION_LOG_LENGTH = 5000
 _strategy_instances: dict[tuple[int, str, str], Strategy] = {}
 _price_histories: dict[tuple[int, str], deque[float]] = {}
 _regime_state: dict[tuple[int, str], dict] = {}
-# Every signal a strategy produced this session and what happened to it --
-# executed, or blocked/shrunk and why. The trade table only shows what
-# *did* happen; this is what lets the frontend show why a strategy that
-# looked "active" still didn't trade.
-_decision_log: dict[int, deque[dict]] = {}
 # Same short rolling window as _price_histories, but kept for every session
 # regardless of auto/fixed mode (that one's only populated in auto mode,
 # for regime detection) -- purely for charting, so it's independent of
@@ -133,14 +118,54 @@ def _clear_position_owner(db: DbSession, session_id: int, symbol: str) -> None:
 _tick_locks: dict[int, threading.Lock] = {}
 
 
-def _log_decision(session_id: int, entry: dict) -> None:
-    if session_id not in _decision_log:
-        _decision_log[session_id] = deque(maxlen=DECISION_LOG_LENGTH)
-    _decision_log[session_id].appendleft({"timestamp": datetime.utcnow().isoformat(), **entry})
+def _log_decision(db: DbSession, session_id: int, entry: dict) -> None:
+    """Records one signal's fate. Written straight to the database rather
+    than an in-memory deque: this record only earns its keep if it's still
+    there when someone goes looking, and a backend restart used to wipe it
+    (8 times across one 194-hour session, including a 7.7-hour outage).
+
+    Not committed here -- run_tick commits once at the end, so a decision and
+    the trade it describes land together or not at all.
+    """
+    db.add(
+        DecisionLogEntry(
+            session_id=session_id,
+            symbol=entry["symbol"],
+            strategy=entry["strategy"],
+            side=entry["side"],
+            outcome=entry["outcome"],
+            reason=entry.get("reason"),
+            detail=entry.get("detail"),
+            qty=entry.get("qty"),
+            price=entry.get("price"),
+            shrunk_pct=entry.get("shrunk_pct"),
+        )
+    )
 
 
-def get_decision_log(session_id: int) -> list[dict]:
-    return list(_decision_log.get(session_id, []))
+def get_decision_log(db: DbSession, session_id: int, limit: int = DECISION_LOG_LENGTH) -> list[dict]:
+    rows = (
+        db.query(DecisionLogEntry)
+        .filter(DecisionLogEntry.session_id == session_id)
+        .order_by(DecisionLogEntry.timestamp.desc(), DecisionLogEntry.id.desc())
+        .limit(limit)
+        .all()
+    )
+    return [
+        {
+            "timestamp": row.timestamp.isoformat(),
+            "symbol": row.symbol,
+            "strategy": row.strategy,
+            "side": row.side,
+            "outcome": row.outcome,
+            "reason": row.reason,
+            "detail": row.detail,
+            "qty": row.qty,
+            "price": row.price,
+            "shrunk_pct": row.shrunk_pct,
+        }
+        for row in rows
+    ]
 
 
 def _get_strategy(db: DbSession, session_id: int, symbol: str, strategy_name: str) -> Strategy:
@@ -461,6 +486,7 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                 if fill is not None:
                     executed.append(f"{fill.side} {fill.qty:.6f} {fill.symbol} @ {fill.price:.2f} (stop-loss)")
                     _log_decision(
+                        db,
                         session_id,
                         {
                             "symbol": symbol,
@@ -538,7 +564,7 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     and strategy_name != active_strategy_name
                     and strategy_name not in REGIME_SELF_GATING_STRATEGIES
                 ):
-                    _log_decision(session_id, {**log_base, "outcome": "blocked_inactive_strategy"})
+                    _log_decision(db, session_id, {**log_base, "outcome": "blocked_inactive_strategy"})
                     strategy.on_signal_not_filled()
                     continue
                 # trend_momentum's own buy is exempt from the regime gate
@@ -553,7 +579,7 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     and strategy_name == "trend_momentum"
                     and _trend_4h_uptrend.get((session_id, symbol)) is not True
                 ):
-                    _log_decision(session_id, {**log_base, "outcome": "blocked_4h_downtrend"})
+                    _log_decision(db, session_id, {**log_base, "outcome": "blocked_4h_downtrend"})
                     strategy.on_signal_not_filled()
                     continue
                 # A sell is allowed through from the position's actual owner
@@ -571,7 +597,7 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     and strategy_name != owner
                     and strategy_name != active_strategy_name
                 ):
-                    _log_decision(session_id, {**log_base, "outcome": "blocked_not_position_owner"})
+                    _log_decision(db, session_id, {**log_base, "outcome": "blocked_not_position_owner"})
                     strategy.on_signal_not_filled()
                     continue
                 # A regime-flip handoff sell (active strategy closing a
@@ -603,13 +629,13 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     and position_cost_basis > 0
                     and price < position_cost_basis * (1 + HANDOFF_MIN_PROFIT_MARGIN_PCT / 100)
                 ):
-                    _log_decision(session_id, {**log_base, "outcome": "blocked_handoff_below_cost_basis"})
+                    _log_decision(db, session_id, {**log_base, "outcome": "blocked_handoff_below_cost_basis"})
                     strategy.on_signal_not_filled()
                     continue
                 # News sentiment only ever holds back or shrinks buys -- selling
                 # out of a position must never be blocked by a bad-news pause.
                 if signal.side == "buy" and sentiment.pause_new_entries:
-                    _log_decision(session_id, {**log_base, "outcome": "blocked_sentiment_pause"})
+                    _log_decision(db, session_id, {**log_base, "outcome": "blocked_sentiment_pause"})
                     strategy.on_signal_not_filled()
                     continue
                 size_fraction = signal.size_fraction
@@ -634,14 +660,14 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     size_fraction *= volatility_size_multiplier(_recent_prices(session_id, signal.symbol))
                 fill = executor.place_order(signal.symbol, signal.side, size_fraction, signal.reason)
                 if fill is None:
-                    _log_decision(session_id, {**log_base, "outcome": "zero_after_sizing"})
+                    _log_decision(db, session_id, {**log_base, "outcome": "zero_after_sizing"})
                     strategy.on_signal_not_filled()
                     continue
                 executed.append(f"{fill.side} {fill.qty:.6f} {fill.symbol} @ {fill.price:.2f} ({signal.reason})")
                 entry = {**log_base, "outcome": "executed", "qty": fill.qty, "price": fill.price}
                 if signal.side == "buy" and size_fraction < original_fraction * 0.99:
                     entry["shrunk_pct"] = round((1 - size_fraction / original_fraction) * 100, 1)
-                _log_decision(session_id, entry)
+                _log_decision(db, session_id, entry)
 
                 if signal.side == "buy":
                     _set_position_owner(db, session_id, signal.symbol, strategy_name)

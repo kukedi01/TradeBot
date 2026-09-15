@@ -11,3 +11,6 @@ backend/.env
 # Windows Scheduled Tasks so backend/frontend survive independently of any
 # one terminal session -- see scripts/start_backend.bat / start_frontend.bat)
 scripts/
+
+# Dev-server logs written by start.ps1
+logs/

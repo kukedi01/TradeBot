@@ -1,6 +1,6 @@
 from collections import deque
 
-from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT
+from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT, REGIME_SELF_GATING_STRATEGIES
 from app.execution.fill_simulator import simulate_fill
 from app.risk.correlation import compute_correlation_matrix_from_returns, correlation_size_multiplier, returns_from_closes
 from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
@@ -105,9 +105,48 @@ def _run_auto(
             cost_basis=avg_cost if held_qty > 0 else 0.0,
         )
 
+        # Position-level stop-loss, checked before any strategy ticks --
+        # same order, and same 12% threshold, as session/loop.py's run_tick.
+        if held_qty > 0:
+            stop_loss = check_position_stop_loss(close, avg_cost)
+            if stop_loss.triggered:
+                fill_price, qty, fee = simulate_fill(close, "sell", 1.0, cash_usd, held_qty)
+                if qty > 0:
+                    realized_pnl = (fill_price - avg_cost) * qty - fee
+                    (win_pnls if realized_pnl > 0 else loss_pnls).append(realized_pnl)
+                    cash_usd += fill_price * qty - fee
+                    held_qty -= qty
+                    position_owner = None
+                    trade_log.append(
+                        {
+                            "side": "sell",
+                            "qty": qty,
+                            "price": fill_price,
+                            "fee": fee,
+                            "reason": f"risk: stop-loss triggered ({stop_loss.loss_pct:.1f}% below entry)",
+                        }
+                    )
+                    # The strategies don't know their position was closed out
+                    # from under them; without this, grid's owned_levels goes
+                    # stale and blocks a legitimate re-buy later.
+                    for other in strategies.values():
+                        other.on_external_sell()
+                    ctx = StrategyContext(
+                        symbol=symbol,
+                        price=close,
+                        cash_usd=cash_usd,
+                        holdings={base_asset: held_qty},
+                        volume=candle[5],
+                        cost_basis=avg_cost if held_qty > 0 else 0.0,
+                    )
+
         for strategy_name, strategy in strategies.items():
             for signal in strategy.on_tick(ctx):
-                if signal.side == "buy" and strategy_name != active_strategy_name:
+                if (
+                    signal.side == "buy"
+                    and strategy_name != active_strategy_name
+                    and strategy_name not in REGIME_SELF_GATING_STRATEGIES
+                ):
                     strategy.on_signal_not_filled()
                     continue
                 if (
@@ -328,6 +367,11 @@ def run_multi_coin_backtest(
     cash_usd = starting_balance_usd
     holdings: dict[str, float] = {}
     cost_basis: dict[str, float] = {}
+    # Which strategy opened the position currently held in each asset, so the
+    # same ownership and handoff-margin rules session/loop.py applies can be
+    # applied here too (they were missing, which is the kind of gap that made
+    # single-symbol "auto" backtests understate the real bot by half).
+    position_owners: dict[str, str] = {}
     strategies: dict[tuple[str, str], object] = {}
     price_histories: dict[str, deque[float]] = {symbol: deque(maxlen=REGIME_HISTORY_LENGTH) for symbol in symbols}
     previous_regime: dict[str, str | None] = {symbol: None for symbol in symbols}
@@ -378,6 +422,7 @@ def run_multi_coin_backtest(
                             (win_pnls if realized_pnl > 0 else loss_pnls).append(realized_pnl)
                             cash_usd += fill_price * qty - fee
                             holdings[base_asset] = held_qty - qty
+                            position_owners.pop(base_asset, None)
                             trade_log.append(
                                 {
                                     "side": "sell",
@@ -405,7 +450,29 @@ def run_multi_coin_backtest(
                 for name in candidate_names:
                     strategy = get_strategy(symbol, name, price)
                     for signal in strategy.on_tick(ctx):
-                        if signal.side == "buy" and name != active_strategy_name:
+                        owner = position_owners.get(base_asset)
+                        if (
+                            signal.side == "buy"
+                            and name != active_strategy_name
+                            and name not in REGIME_SELF_GATING_STRATEGIES
+                        ):
+                            strategy.on_signal_not_filled()
+                            continue
+                        if (
+                            signal.side == "sell"
+                            and owner is not None
+                            and name != owner
+                            and name != active_strategy_name
+                        ):
+                            strategy.on_signal_not_filled()
+                            continue
+                        if (
+                            signal.side == "sell"
+                            and owner is not None
+                            and name != owner
+                            and cost_basis.get(base_asset, 0.0) > 0
+                            and price < cost_basis[base_asset] * (1 + HANDOFF_MIN_PROFIT_MARGIN_PCT / 100)
+                        ):
                             strategy.on_signal_not_filled()
                             continue
                         size_fraction = signal.size_fraction
@@ -427,11 +494,14 @@ def run_multi_coin_backtest(
                             avg_cost = cost_basis.get(base_asset, 0.0)
                             cost_basis[base_asset] = (avg_cost * held_qty + fill_price * qty) / (held_qty + qty)
                             holdings[base_asset] = held_qty + qty
+                            position_owners[base_asset] = name
                         else:
                             realized_pnl = (fill_price - cost_basis.get(base_asset, 0.0)) * qty - fee
                             (win_pnls if realized_pnl > 0 else loss_pnls).append(realized_pnl)
                             cash_usd += fill_price * qty - fee
                             holdings[base_asset] = held_qty - qty
+                            if holdings[base_asset] <= 1e-9:
+                                position_owners.pop(base_asset, None)
                         trade_log.append(
                             {
                                 "side": signal.side,

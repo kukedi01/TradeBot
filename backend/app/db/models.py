@@ -80,6 +80,35 @@ class StrategyState(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
 
+class DecisionLogEntry(Base):
+    """Every signal any strategy produced and what happened to it -- executed,
+    or blocked/shrunk and why.
+
+    This used to live only in a module-level deque, which meant it vanished on
+    every backend restart. Measured over one 194-hour session that was 8 times,
+    including a 7.7-hour outage -- so the record of *why the bot didn't trade*,
+    which is the single most useful diagnostic here, was routinely gone by the
+    time anyone looked. Persisting it also makes per-strategy P&L attribution
+    possible, since each executed row carries the strategy, side, qty and
+    price needed to reconstruct who actually made money.
+    """
+
+    __tablename__ = "decision_log"
+
+    id = Column(Integer, primary_key=True, index=True)
+    session_id = Column(Integer, index=True)
+    timestamp = Column(DateTime, default=datetime.utcnow, index=True)
+    symbol = Column(String, nullable=False)
+    strategy = Column(String, nullable=False)
+    side = Column(String, nullable=False)
+    outcome = Column(String, nullable=False, index=True)
+    reason = Column(String, nullable=True)
+    detail = Column(String, nullable=True)
+    qty = Column(Float, nullable=True)
+    price = Column(Float, nullable=True)
+    shrunk_pct = Column(Float, nullable=True)
+
+
 class MarketFlowSnapshot(Base):
     """Order-flow readings sampled every tick: cumulative volume delta and
     open interest (see market_data/flow.py). Deliberately keyed by symbol
