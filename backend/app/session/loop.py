@@ -26,6 +26,29 @@ from app.strategies.regime import REGIME_STRATEGY, pick_strategy
 # it (see strategies/regime.py).
 AUTO_STRATEGY = "auto"
 
+# Strategies allowed to open positions regardless of which one the regime
+# classifier currently favours, because each already refuses its own weak
+# setups: trend_momentum needs a confirmed cross (min_cross_gap_pct), MACD
+# agreement, above-average volume and 4h trend agreement; grid needs a real
+# level crossing past min_move_pct hysteresis and will only exit above its
+# blended cost basis.
+#
+# The regime gate used to apply to grid, and measurement showed it was doing
+# active harm. Over a 29-day window the label read "trending" 27-38% of the
+# time, and in those stretches grid's buys were blocked -- 36 blocked against
+# 13 executed on SOL, 30 against 7 on XRP -- while trend_momentum, the
+# strategy the gate handed control to, executed 0-1 buys in the entire
+# period (its Kelly size is 0.08-0.24 on three of the four coins, since it
+# has no proven edge there). The result was a bot that simply sat idle for
+# roughly a third of every session: the strategy that would have traded was
+# locked out, and the one holding the keys never acted. Removing the gate
+# roughly doubled backtested "auto" returns (+2.7% -> +5.3% averaged over
+# both market types and all four coins, better in 5 of 8 cases, notably SOL
+# +2.3% -> +14.0%). The regime label still selects which strategy is
+# reported as active and still governs handoff sells; it just no longer
+# decides who is allowed to trade at all.
+REGIME_SELF_GATING_STRATEGIES = {"grid", "trend_momentum"}
+
 REGIME_HISTORY_LENGTH = 30
 # How many ticks the coin charts (price/volume/RSI/MACD) show -- deliberately
 # decoupled from REGIME_HISTORY_LENGTH, which is what the strategies
@@ -453,29 +476,22 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
             for signal in signals:
                 log_base = {"symbol": signal.symbol, "strategy": strategy_name, "side": signal.side, "reason": signal.reason}
 
-                # Only the regime-selected strategy gets to open new
-                # positions -- but a sell from an inactive strategy (e.g. it
-                # bought while active, then lost the regime and now wants to
-                # exit) always goes through. Otherwise a coin bought under a
-                # strategy that's no longer active could be stranded with no
-                # one left willing to sell it.
+                # A sell from an inactive strategy (e.g. it bought while
+                # active, then lost the regime and now wants to exit) always
+                # goes through, or a coin bought under a strategy that's no
+                # longer active could be stranded with no one left willing to
+                # sell it.
                 #
-                # trend_momentum's own buy signal is exempt from this gate:
-                # unlike grid (which has no internal noise filter and truly
-                # needs the regime gate), trend_momentum already requires a
-                # confirmed cross (min_cross_gap_pct), MACD agreement, and
-                # above-average volume on a real hourly candle before it
-                # ever proposes a buy -- a separate, cruder regime check (30
-                # raw ticks, ~15 minutes) can still be lagging behind a
-                # genuine hourly trend it has already confirmed. Live
-                # evidence: a fully-confirmed BTC golden cross got blocked
-                # here because the regime label hadn't flipped to
-                # "trending" yet, and price kept rising afterward -- a real
-                # missed entry, not a noise trade the gate correctly caught.
+                # Buys from a strategy in REGIME_SELF_GATING_STRATEGIES are
+                # exempt from the regime gate entirely -- see that constant
+                # for the measurements that led there. What remains gated is
+                # dca_rebalance, which buys on a schedule rather than on any
+                # market condition, so with no gate it would simply spend the
+                # pool regardless of what the market is doing.
                 if (
                     signal.side == "buy"
                     and strategy_name != active_strategy_name
-                    and strategy_name != "trend_momentum"
+                    and strategy_name not in REGIME_SELF_GATING_STRATEGIES
                 ):
                     _log_decision(session_id, {**log_base, "outcome": "blocked_inactive_strategy"})
                     strategy.on_signal_not_filled()
