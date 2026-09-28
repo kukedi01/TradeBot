@@ -13,6 +13,11 @@ def _build_grid(symbol: str, price: float, size_fraction_override: float | None 
         upper_bound=price * 1.05,
         grid_levels=10,
         order_size_fraction=size_fraction_override if size_fraction_override is not None else 0.1,
+        # 0.85%, not the class default 0.3% -- see GridStrategy's docstring for
+        # the sweep. The short version: 0.3% sits *below* the ~0.62%
+        # round-trip fee+slippage cost, so the hysteresis was letting through
+        # exactly the trades that cannot pay for themselves.
+        min_move_pct=0.85,
     )
 
 

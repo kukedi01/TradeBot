@@ -3,7 +3,12 @@ from collections import deque
 from app.constants import HANDOFF_MIN_PROFIT_MARGIN_PCT, REGIME_SELF_GATING_STRATEGIES
 from app.execution.fill_simulator import simulate_fill
 from app.risk.correlation import compute_correlation_matrix_from_returns, correlation_size_multiplier, returns_from_closes
-from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
+from app.risk.guardrails import (
+    cash_reserve_size_multiplier,
+    check_drawdown_limit,
+    check_position_stop_loss,
+    concentration_size_multiplier,
+)
 from app.risk.volatility import volatility_size_multiplier
 from app.strategies.base import StrategyContext
 from app.strategies.registry import STRATEGY_BUILDERS
@@ -494,6 +499,11 @@ def run_multi_coin_backtest(
                             size_fraction *= correlation_size_multiplier(symbol, holdings, prices, correlation_matrix)
                             size_fraction *= concentration_size_multiplier(
                                 symbol, size_fraction, cash_usd, holdings, prices
+                            )
+                            size_fraction *= cash_reserve_size_multiplier(
+                                size_fraction,
+                                cash_usd,
+                                cash_usd + sum(holdings.get(s.split("/")[0], 0) * p for s, p in prices.items()),
                             )
                             window_start = max(0, step + 1 - REGIME_HISTORY_LENGTH)
                             recent_closes = [c[4] for c in aligned[symbol][window_start : step + 1]]

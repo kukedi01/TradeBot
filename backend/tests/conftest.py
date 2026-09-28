@@ -105,24 +105,28 @@ def make_session(db):
     return _make
 
 
+_MODULE_CACHES = (
+    "_strategy_instances",
+    "_price_histories",
+    "_regime_state",
+    "_chart_histories",
+    "_last_raw_volume",
+    "_last_known_price",
+    "_position_owners",
+    "_tick_locks",
+    "_candle_buckets",
+    "_candle_4h_buckets",
+    "_trend_4h_history",
+    "_trend_4h_uptrend",
+)
+
+
 @pytest.fixture
 def loop_env(monkeypatch):
     """Stubs every outbound call run_tick makes and clears the module-level
     caches, so tests can't leak state into each other through them."""
-    for cache in (
-        loop_module._strategy_instances,
-        loop_module._price_histories,
-        loop_module._regime_state,
-        loop_module._chart_histories,
-        loop_module._last_raw_volume,
-        loop_module._position_owners,
-        loop_module._tick_locks,
-        loop_module._candle_buckets,
-        loop_module._candle_4h_buckets,
-        loop_module._trend_4h_history,
-        loop_module._trend_4h_uptrend,
-    ):
-        cache.clear()
+    for name in _MODULE_CACHES:
+        getattr(loop_module, name).clear()
 
     prices = dict(TEST_PRICES)
     monkeypatch.setattr(loop_module, "get_ticker_price", lambda symbol: prices[symbol])
@@ -197,6 +201,19 @@ def loop_env(monkeypatch):
 
         def set_owner(self, session_id: int, symbol: str, owner: str):
             loop_module._position_owners[(session_id, symbol)] = owner
+
+        def simulate_restart(self):
+            """Wipes every module-level cache mid-test, the same way an
+            actual backend restart does -- but leaves the database alone,
+            since that's the whole point: the DB is what's supposed to
+            survive. Lets a test tick, "restart", tick again, and check that
+            whatever mattered (ownership, strategy memory) was really
+            persisted rather than just sitting in memory. This is the general
+            form of a bug this project has hit three times already in its
+            specific forms: phantom grid levels, a wiped decision log, and a
+            retuned parameter getting silently overwritten by stale state."""
+            for name in _MODULE_CACHES:
+                getattr(loop_module, name).clear()
 
         def decisions(self, db_session, session_id: int):
             return loop_module.get_decision_log(db_session, session_id)

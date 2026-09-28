@@ -54,6 +54,26 @@ class StrategyContext:
 class Strategy(ABC):
     name: str
 
+    # Attribute names that are *configuration*, not memory. load_state skips
+    # them, so a freshly built instance keeps the value the registry (or
+    # Kelly sizing) just gave it instead of having a stale one restored over
+    # the top.
+    #
+    # Without this, a tuning change can never reach a session that is already
+    # running: get_state() snapshots every attribute via vars(self), so a
+    # parameter edited in the registry is silently overwritten on the next
+    # restart by whatever the database remembers. That is not theoretical --
+    # raising grid's min_move_pct from 0.3 to 0.85 after a backtest sweep
+    # would have applied to new sessions only, while the 17-day live session
+    # the sweep was run *for* kept trading on 0.3 indefinitely.
+    #
+    # Only genuinely independent knobs belong here. Grid's band bounds and
+    # step, for instance, look like configuration but are memory: the band
+    # recenters itself as price drifts, and step is derived from bounds and
+    # grid_levels together, so restoring one without the others would leave
+    # the strategy internally inconsistent.
+    TUNING_ATTRS: frozenset[str] = frozenset()
+
     @abstractmethod
     def on_tick(self, ctx: StrategyContext) -> list[TradeSignal]:
         ...
@@ -104,6 +124,8 @@ class Strategy(ABC):
 
     def load_state(self, state: dict) -> None:
         for key, value in state.items():
+            if key in self.TUNING_ATTRS:
+                continue
             if isinstance(value, dict) and "__set__" in value:
                 setattr(self, key, set(value["__set__"]))
             elif isinstance(value, dict) and "__deque__" in value:

@@ -35,6 +35,21 @@ class TrendMomentumStrategy(Strategy):
 
     name = "trend_momentum"
 
+    # price_history/volume_history are memory; the periods and
+    # thresholds that interpret them are configuration.
+    TUNING_ATTRS = frozenset(
+        {
+            "fast_ma_period",
+            "slow_ma_period",
+            "rsi_period",
+            "rsi_extreme_overbought",
+            "bollinger_period",
+            "order_size_fraction",
+            "min_cross_gap_pct",
+            "volume_confirmation_multiplier",
+        }
+    )
+
     def __init__(
         self,
         symbol: str,

@@ -6,6 +6,7 @@ two most expensive bugs actually lived -- neither was a fault in any single
 strategy, and neither was reachable from the strategy-level tests.
 """
 from app.db.models import DecisionLogEntry, Portfolio, PortfolioSnapshot, Trade, TradingSession
+from app.session import loop as loop_module
 from app.session.loop import run_tick
 from app.strategies.base import TradeSignal
 
@@ -395,3 +396,152 @@ class TestDecisionLogPersistence:
         # the order actually paid (5bps above 60000 on a buy).
         assert executed.price == 60030.0
         assert executed.strategy == "grid"
+
+
+class TestPriceFetchIsolation:
+    """One Kraken hiccup on a single coin must never cancel the whole tick.
+
+    Before this, `prices = {s: get_ticker_price(s) for s in TRADABLE_SYMBOLS}`
+    had no per-symbol error handling: a raise from any one of the four coins
+    propagated out of the dict comprehension, out of run_tick, uncaught --
+    and the scheduler's default handling (log and move on) meant every coin
+    was skipped that cycle, not just the flaky one. Not hypothetical: this
+    exact error was seen live from Kraken during this project's own backtest
+    sweeps racing the live session for the same rate limit.
+    """
+
+    def test_a_failed_symbol_does_not_block_the_others(self, db, make_session, loop_env, monkeypatch):
+        session_id = make_session()
+        loop_env.set_regime("grid", "ranging")
+        eth_signal = TradeSignal(symbol="ETH/EUR", side="buy", size_fraction=0.5, reason="test buy")
+        loop_env.install(session_id, "ETH/EUR", {"grid": ScriptedStrategy("grid", [eth_signal])})
+
+        good_prices = dict(loop_env.prices)
+
+        def flaky_fetch(symbol):
+            if symbol == "BTC/EUR":
+                raise TimeoutError("kraken timeout")
+            return good_prices[symbol]
+
+        monkeypatch.setattr(loop_module, "get_ticker_price", flaky_fetch)
+
+        run_tick(db, session_id)
+
+        assert len(trades_for(db, session_id, "ETH/EUR")) == 1
+
+    def test_the_failed_symbol_itself_trades_nothing_that_tick(self, db, make_session, loop_env, monkeypatch):
+        session_id = make_session()
+        loop_env.set_regime("grid", "ranging")
+        loop_env.install(session_id, SYMBOL, {"grid": ScriptedStrategy("grid", [buy()])})
+
+        monkeypatch.setattr(
+            loop_module,
+            "get_ticker_price",
+            lambda symbol: (_ for _ in ()).throw(TimeoutError("kraken timeout")) if symbol == SYMBOL else 1.0,
+        )
+
+        run_tick(db, session_id)
+
+        assert trades_for(db, session_id) == []
+
+    def test_a_portfolio_snapshot_still_gets_recorded_despite_the_failure(self, db, make_session, loop_env, monkeypatch):
+        """Accounting must degrade gracefully (skip the unpriced coin) rather
+        than crash the whole tick -- losing the snapshot would be worse than
+        the original bug, since it would also break the drawdown guardrail's
+        peak-tracking for every OTHER coin too."""
+        session_id = make_session()
+        loop_env.set_regime("grid", "ranging")
+
+        good_prices = dict(loop_env.prices)
+
+        def flaky_fetch(symbol):
+            if symbol == "BTC/EUR":
+                raise TimeoutError("kraken timeout")
+            return good_prices[symbol]
+
+        monkeypatch.setattr(loop_module, "get_ticker_price", flaky_fetch)
+
+        run_tick(db, session_id)
+
+        assert db.query(PortfolioSnapshot).filter(PortfolioSnapshot.session_id == session_id).count() == 1
+
+    def test_a_later_tick_recovers_once_the_price_comes_back(self, db, make_session, loop_env, monkeypatch):
+        """The fallback is transient, not sticky -- once a fetch succeeds
+        again, trading on that coin resumes normally."""
+        session_id = make_session()
+        loop_env.set_regime("grid", "ranging")
+        good_prices = dict(loop_env.prices)
+        strategy = ScriptedStrategy("grid", [buy()])
+        loop_env.install(session_id, SYMBOL, {"grid": strategy})
+
+        monkeypatch.setattr(
+            loop_module,
+            "get_ticker_price",
+            lambda symbol: (_ for _ in ()).throw(TimeoutError("kraken timeout")) if symbol == SYMBOL else good_prices[symbol],
+        )
+        run_tick(db, session_id)
+        assert trades_for(db, session_id) == []
+
+        monkeypatch.setattr(loop_module, "get_ticker_price", lambda symbol: good_prices[symbol])
+        strategy._signals = [buy()]
+        run_tick(db, session_id)
+
+        assert len(trades_for(db, session_id)) == 1
+
+
+class TestRestartRecovery:
+    """A backend restart wipes every module-level cache but never the
+    database -- this project has hit that gap three separate times in three
+    specific shapes (phantom grid owned_levels after a handoff sell, a
+    wiped in-memory decision log, a retuned parameter silently overwritten
+    by stale saved state). Each got its own narrow regression test once
+    found. This class tests the *general* case: tick, simulate a restart,
+    tick again, and check that what actually matters -- position ownership
+    -- survived rather than just having lived in memory.
+    """
+
+    def test_position_ownership_survives_a_restart(self, db, make_session, loop_env):
+        session_id = make_session()
+        loop_env.set_regime("grid", "ranging")
+        loop_env.install(session_id, SYMBOL, {"grid": ScriptedStrategy("grid", [buy()])})
+
+        run_tick(db, session_id)
+        assert len(trades_for(db, session_id)) == 1
+
+        loop_env.simulate_restart()
+
+        # Post-restart: a regime flip hands control to trend_momentum, which
+        # tries to close the position grid opened before the "restart" --
+        # below the margin a handoff sell needs. If ownership were forgotten
+        # (fell back to the permissive "unknown owner" path) this would
+        # execute; if it survived the restart, it's blocked.
+        loop_env.set_regime("trend_momentum", "trending")
+        loop_env.install(session_id, SYMBOL, {"trend_momentum": ScriptedStrategy("trend_momentum", [sell()])})
+        # trend_momentum only ticks on an hourly candle close (see
+        # CANDLE_INTERVAL_SECONDS) -- without this it's skipped outright and
+        # the sell signal below would never even be evaluated.
+        loop_env.arm_hourly_candle_close(session_id, SYMBOL)
+
+        run_tick(db, session_id)
+
+        assert trades_for(db, session_id)[-1].side == "buy"  # no second (sell) trade landed
+        assert "blocked_handoff_below_cost_basis" in loop_env.outcomes(db, session_id)
+
+    def test_the_owner_can_still_sell_its_own_position_after_a_restart(self, db, make_session, loop_env):
+        """The flip side of the test above: persistence must not become
+        over-strict and strand a position the real owner wants to close."""
+        session_id = make_session()
+        loop_env.set_regime("grid", "ranging")
+        loop_env.install(session_id, SYMBOL, {"grid": ScriptedStrategy("grid", [buy()])})
+
+        run_tick(db, session_id)
+
+        loop_env.simulate_restart()
+
+        loop_env.set_regime("grid", "ranging")
+        loop_env.install(session_id, SYMBOL, {"grid": ScriptedStrategy("grid", [sell()])})
+
+        run_tick(db, session_id)
+
+        sides = [t.side for t in trades_for(db, session_id)]
+        assert sides == ["buy", "sell"]

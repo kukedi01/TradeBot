@@ -13,6 +13,20 @@ class GridStrategy(Strategy):
     back and forth and churn fees on trades that aren't really "dips" or
     "rises" at all.
 
+    `min_move_pct` defaults to 0.3 here but the registry builds live and
+    backtested grids at **0.85**, and that gap is the point: 0.3% is *below*
+    the ~0.62% round-trip fee+slippage cost, so the bar a trade had to clear
+    was lower than the bar it had to clear to break even. A sweep across 8
+    backtest windows (30-180 days, all four coins, live Kelly sizing) put
+    0.3% at -7.87% against HODL on average; 0.8/0.85/0.9% came in at
+    -2.84/-4.16/-3.45%, with lower fees and lower max drawdown, and 0.8%
+    beat 0.3% in 7 of the 8 windows individually. The three values form a
+    plateau rather than one lucky spike, and 0.85 is deliberately its
+    *centre* rather than its best-scoring point -- picking the argmax of a
+    noisy sweep is how a parameter gets fitted to its own backtest. Values
+    between 0.3 and 0.75 measured no better than 0.3 itself, so the gain
+    appears once the bar clears trading costs, not gradually.
+
     A "sell" only fires once price actually clears the position's blended
     average cost by min_profit_margin_pct -- not just once price rises one
     level above the last trade. Without this, averaging down through
@@ -29,6 +43,12 @@ class GridStrategy(Strategy):
     """
 
     name = "grid"
+
+    # Bounds/step/owned_levels are memory (the band recenters itself);
+    # these four are knobs that must follow the registry, not the DB.
+    TUNING_ATTRS = frozenset(
+        {"min_move_pct", "min_profit_margin_pct", "order_size_fraction", "recenter_after_ticks_out_of_range"}
+    )
 
     def __init__(
         self,

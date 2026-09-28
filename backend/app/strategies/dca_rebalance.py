@@ -8,6 +8,11 @@ class DcaRebalanceStrategy(Strategy):
 
     name = "dca_rebalance"
 
+    # tick_count is memory (it drives the schedule); the rest are knobs.
+    TUNING_ATTRS = frozenset(
+        {"target_allocation_pct", "drift_threshold_pct", "dca_interval_ticks", "dca_size_fraction"}
+    )
+
     def __init__(
         self,
         symbol: str,

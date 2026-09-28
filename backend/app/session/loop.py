@@ -14,7 +14,12 @@ from app.market_data.kraken_client import get_ticker_price, get_ticker_volume
 from app.news.reactor import get_sentiment_state
 from app.notifications import send_desktop_notification
 from app.risk.correlation import correlation_size_multiplier, get_correlation_matrix
-from app.risk.guardrails import check_drawdown_limit, check_position_stop_loss, concentration_size_multiplier
+from app.risk.guardrails import (
+    cash_reserve_size_multiplier,
+    check_drawdown_limit,
+    check_position_stop_loss,
+    concentration_size_multiplier,
+)
 from app.risk.position_sizing import compute_kelly_size_for_strategy
 from app.risk.volatility import volatility_size_multiplier
 from app.session.state_store import POSITION_OWNER_KEY, REGIME_HISTORY_KEY, TREND_4H_HISTORY_KEY, load_state, save_state
@@ -78,6 +83,12 @@ _chart_histories: dict[tuple[int, str], deque[dict]] = {}
 # read off the last chart-history entry) so it also works on the very
 # first tick after a restart, when there's no history yet to diff against.
 _last_raw_volume: dict[tuple[int, str], float] = {}
+# Last successfully fetched price per symbol, market-wide rather than
+# per-session -- price is a market fact, not session state. Used only as a
+# valuation fallback when a fetch fails mid-tick (see _fetch_prices); never
+# handed to a strategy to trade on, since acting on a stale price is worse
+# than skipping a tick.
+_last_known_price: dict[str, float] = {}
 # Which strategy currently owns the open position on a symbol, set on a buy
 # fill and cleared once the position is fully closed. Without this, any
 # non-active strategy still ticking in the background (e.g. trend_momentum
@@ -297,6 +308,52 @@ def _portfolio_value(portfolio: Portfolio, prices: dict[str, float]) -> float:
     return portfolio.cash_usd + sum(
         holdings.get(symbol.split("/")[0], 0) * price for symbol, price in prices.items()
     )
+
+
+def _fetch_prices(symbols: list[str]) -> tuple[dict[str, float], set[str]]:
+    """This tick's price for every symbol, with one Kraken hiccup on any
+    single coin isolated from the rest.
+
+    Before this, `prices = {s: get_ticker_price(s) for s in TRADABLE_SYMBOLS}`
+    had no per-symbol error handling: a timeout or rate limit on any ONE of
+    the four coins raised out of the dict comprehension, propagated through
+    run_tick uncaught, and the scheduler's default handling (log and move on)
+    meant the entire tick was skipped for every coin that cycle -- not just
+    the one that failed. This isn't hypothetical: this exact error was seen
+    live from Kraken during this project's own backtest sweeps competing with
+    the live session for the same rate limit
+    (`ccxt.base.errors.DDoSProtection: kraken {"error":["EGeneral:Too many
+    requests"]}`).
+
+    Returns (prices, failed). `prices` always has an entry for a symbol that
+    has ever succeeded before -- falling back to the last known value on a
+    failed fetch -- so downstream valuation (the portfolio snapshot, the HODL
+    baseline, correlation/concentration sizing of a *different* coin's buy)
+    never crashes or silently treats a held coin as worthless, which would
+    otherwise show up as a fake drop and could even trip the drawdown
+    guardrail. `failed` names which symbols had no fresh price this tick, so
+    the caller can skip trading on them entirely rather than act on a
+    potentially stale one -- only accounting reads the fallback, never a
+    strategy.
+    """
+    prices: dict[str, float] = {}
+    failed: set[str] = set()
+    for symbol in symbols:
+        try:
+            price = get_ticker_price(symbol)
+        except Exception:
+            fallback = _last_known_price.get(symbol)
+            if fallback is not None:
+                prices[symbol] = fallback
+            failed.add(symbol)
+            continue
+        prices[symbol] = price
+        _last_known_price[symbol] = price
+
+    if failed:
+        print(f"[price fetch] skipping this tick for: {sorted(failed)}")
+
+    return prices, failed
 
 
 def _volume_delta(session_id: int, symbol: str, raw_volume_24h: float) -> float:
@@ -529,10 +586,14 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
     # Fetched upfront (not lazily as each symbol is processed) so the
     # correlation-based sizing below always has every coin's current price
     # available, even for a buy signal on the first symbol in the loop.
-    prices: dict[str, float] = {symbol: get_ticker_price(symbol) for symbol in TRADABLE_SYMBOLS}
+    # failed_symbols is skipped below -- see _fetch_prices for why a fetch
+    # failure on one coin must not cancel the tick for the other three.
+    prices, failed_symbols = _fetch_prices(TRADABLE_SYMBOLS)
     correlation_matrix = get_correlation_matrix(TRADABLE_SYMBOLS)
     volumes: dict[str, float] = {}
     for symbol in TRADABLE_SYMBOLS:
+        if symbol in failed_symbols:
+            continue
         try:
             raw_volume = get_ticker_volume(symbol)
         except Exception:
@@ -542,6 +603,8 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
         _record_market_flow(db, symbol, prices[symbol])
 
     for symbol in TRADABLE_SYMBOLS:
+        if symbol in failed_symbols:
+            continue
         price = prices[symbol]
 
         if is_auto:
@@ -756,6 +819,13 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
                     size_fraction *= concentration_size_multiplier(
                         signal.symbol, size_fraction, portfolio.cash_usd, portfolio.holdings or {}, prices
                     )
+                    # Currently a no-op (MIN_CASH_RESERVE_PCT is 0), but wired
+                    # on both sides so enabling it can never mean the backtest
+                    # and the live bot size buys differently -- that exact
+                    # drift has produced three separate bugs here already.
+                    size_fraction *= cash_reserve_size_multiplier(
+                        size_fraction, portfolio.cash_usd, _portfolio_value(portfolio, prices)
+                    )
                     # Choppier-than-usual right now -> smaller bet; calmer
                     # than usual -> a somewhat bigger one.
                     size_fraction *= volatility_size_multiplier(_recent_prices(session_id, signal.symbol))
@@ -826,8 +896,16 @@ def _run_tick_locked(db: DbSession, session_id: int) -> list[str]:
     holdings = portfolio.holdings or {}
     total_value = portfolio.cash_usd
     for symbol in TRADABLE_SYMBOLS:
+        # .get(), not [symbol]: prices only lacks an entry if this coin has
+        # never had a successful fetch at all (the coldest possible start),
+        # since _fetch_prices otherwise falls back to the last known value.
+        # Skipping it here undercounts total_value rather than crashing the
+        # whole snapshot -- a bounded, rare degradation instead of an outage.
+        price = prices.get(symbol)
+        if price is None:
+            continue
         base_asset = symbol.split("/")[0]
-        total_value += holdings.get(base_asset, 0) * prices[symbol]
+        total_value += holdings.get(base_asset, 0) * price
 
     hodl_value = _hodl_value(session, prices)
     db.add(PortfolioSnapshot(session_id=session_id, total_value_eur=total_value, hodl_value_eur=hodl_value))
@@ -877,8 +955,10 @@ def _hodl_value(session: TradingSession, prices: dict[str, float]) -> float:
     value = 0.0
     for symbol in TRADABLE_SYMBOLS:
         start_price = starting_prices.get(symbol)
-        if not start_price:
+        # See total_value's own .get() above for why this can't be prices[symbol].
+        current_price = prices.get(symbol)
+        if not start_price or current_price is None:
             continue
         qty = share / start_price
-        value += qty * prices[symbol]
+        value += qty * current_price
     return value

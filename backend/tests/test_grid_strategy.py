@@ -106,3 +106,86 @@ class TestExternalStateCorrections:
         tick(grid, 100.0)
         grid.on_signal_not_filled()  # nothing pending -- must not raise
         assert grid.owned_levels == set()
+
+
+class TestHysteresisClearsTradingCosts:
+    """The registry builds grids at min_move_pct=0.85, not the class default
+    0.3. The reason is arithmetic, not taste: a round trip costs ~0.62% in
+    fees and slippage, so a 0.3% bar admitted trades that could not pay for
+    themselves. Across 8 backtest windows 0.3% averaged -7.87% against HODL
+    and the 0.8-0.9 plateau -2.84 to -4.16%."""
+
+    def test_the_registry_builds_grids_above_the_round_trip_cost(self):
+        from app.execution.fill_simulator import SLIPPAGE_BPS, TAKER_FEE_RATE
+        from app.strategies.registry import STRATEGY_BUILDERS
+
+        grid = STRATEGY_BUILDERS["grid"]("BTC/EUR", 50000.0)
+        round_trip_pct = (TAKER_FEE_RATE * 2 + (SLIPPAGE_BPS / 10000) * 2) * 100
+
+        assert grid.min_move_pct > round_trip_pct
+
+    def test_a_move_smaller_than_the_bar_does_not_fire(self):
+        from app.strategies.base import StrategyContext
+        from app.strategies.grid import GridStrategy
+
+        grid = GridStrategy("BTC/EUR", lower_bound=9500, upper_bound=10500, grid_levels=10, min_move_pct=0.85)
+        grid.last_level = 6
+        grid.last_trade_price = 10000.0
+
+        # 9960 is a level below, but only 0.4% away -- under the bar.
+        signals = grid.on_tick(StrategyContext(symbol="BTC/EUR", price=9960.0, cash_usd=1000.0, holdings={}))
+
+        assert signals == []
+
+    def test_a_move_clearing_the_bar_still_fires(self):
+        from app.strategies.base import StrategyContext
+        from app.strategies.grid import GridStrategy
+
+        grid = GridStrategy("BTC/EUR", lower_bound=9500, upper_bound=10500, grid_levels=10, min_move_pct=0.85)
+        grid.last_level = 6
+        grid.last_trade_price = 10000.0
+
+        # 9880 is 1.2% away, clearing the bar, and a level below.
+        signals = grid.on_tick(StrategyContext(symbol="BTC/EUR", price=9880.0, cash_usd=1000.0, holdings={}))
+
+        assert len(signals) == 1
+        assert signals[0].side == "buy"
+
+
+class TestTuningAttrsAreNotRestoredFromState:
+    """A restored session must pick up retuned parameters, not overwrite them
+    with whatever the database happens to remember. Without this, raising
+    min_move_pct from 0.3 to 0.85 would have reached new sessions only, while
+    the long-running session the sweep was run for kept trading on 0.3."""
+
+    def test_a_retuned_parameter_survives_a_state_restore(self):
+        from app.strategies.grid import GridStrategy
+
+        old = GridStrategy("BTC/EUR", lower_bound=9500, upper_bound=10500, grid_levels=10, min_move_pct=0.3)
+        old.owned_levels = {2, 4}
+        old.last_level = 4
+        saved = old.get_state()
+
+        rebuilt = GridStrategy("BTC/EUR", lower_bound=9500, upper_bound=10500, grid_levels=10, min_move_pct=0.85)
+        rebuilt.load_state(saved)
+
+        assert rebuilt.min_move_pct == 0.85
+
+    def test_memory_is_still_restored(self):
+        """The whole point of persistence must keep working -- only the knobs
+        are skipped, not the strategy's accumulated state."""
+        from app.strategies.grid import GridStrategy
+
+        old = GridStrategy("BTC/EUR", lower_bound=9500, upper_bound=10500, grid_levels=10)
+        old.owned_levels = {2, 4}
+        old.last_level = 4
+        old.last_trade_price = 9876.0
+        saved = old.get_state()
+
+        rebuilt = GridStrategy("BTC/EUR", lower_bound=1, upper_bound=2, grid_levels=10)
+        rebuilt.load_state(saved)
+
+        assert rebuilt.owned_levels == {2, 4}
+        assert rebuilt.last_level == 4
+        assert rebuilt.last_trade_price == 9876.0
+        assert rebuilt.lower_bound == 9500  # band bounds are memory, not a knob
